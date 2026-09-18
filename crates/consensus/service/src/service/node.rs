@@ -19,9 +19,10 @@ use base_consensus_providers::{
     AlloyChainProvider, AlloyL2ChainProvider, OnlineBeaconClient, OnlineBlobProvider,
     OnlinePipeline,
 };
-use base_consensus_rpc::RpcBuilder;
+use base_consensus_rpc::{BaseRpc, RpcBuilder};
 use base_consensus_safedb::{DisabledSafeDB, SafeDB, SafeDBReader, SafeHeadListener};
 use base_protocol::L2BlockInfo;
+use base_upgrade_signal::{UpgradeSignalMetricLayer, UpgradeSignalMetrics};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
@@ -407,6 +408,11 @@ impl RollupNode {
         DerivationActor<QueuedDerivationEngineClient, P>:
             NodeActor<StartData = (), Error = DerivationError>,
     {
+        UpgradeSignalMetrics::record_mode(
+            UpgradeSignalMetricLayer::Consensus,
+            self.upgrade_signal_config.as_ref().map(|config| config.config.mode),
+        );
+
         // Build the safe head DB pair. Both actors share the same underlying DB via Arc.
         //
         // In delegate mode the local derivation actor is replaced by a `DelegateDerivationActor`
@@ -615,6 +621,7 @@ impl RollupNode {
                     engine_client,
                     is_active: self.sequencer_config.sequencer_stopped.not(),
                     shadow_blocks_per_cycle: self.sequencer_config.shadow_blocks_per_cycle,
+                    shadow_funding: self.sequencer_config.shadow_funding,
                     recovery_mode,
                     rollup_config: Arc::clone(&self.config),
                     seal_offset: self.sequencer_config.seal_offset,
@@ -633,6 +640,14 @@ impl RollupNode {
         let engine_rpc_actor = rpc_builder
             .as_ref()
             .map(|_| (engine_rpc_processor, (cancellation.clone(), engine_rpc_request_rx)));
+        // Public `base` namespace, available whenever the upgrade signal is configured (any mode),
+        // built from the same config and reader the node uses. The readiness report accounts for the
+        // configured mode, so a node whose mode does not apply the live schedule is not reported
+        // ready for it.
+        let base_rpc = self
+            .upgrade_signal_config
+            .as_ref()
+            .map(|c| BaseRpc::new(c.config.clone(), c.reader.clone()));
         let rpc = rpc_builder.map(|b| {
             RpcActor::new(
                 b,
@@ -640,6 +655,7 @@ impl RollupNode {
                 sequencer_admin_client,
                 safe_db_reader,
                 upgrade_signal_refresher,
+                base_rpc,
             )
         });
 

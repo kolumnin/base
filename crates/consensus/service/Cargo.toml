@@ -65,7 +65,6 @@ opentelemetry.workspace = true
 async-trait.workspace = true
 async-stream.workspace = true
 tokio-stream.workspace = true
-libp2p-stream.workspace = true
 http-body-util.workspace = true
 strum = { workspace = true, features = ["derive"] }
 tracing = { workspace = true, features = ["std"] }
@@ -91,7 +90,10 @@ httpmock.workspace = true
 tempfile.workspace = true
 arbitrary.workspace = true
 alloy-network.workspace = true
+tracing-subscriber.workspace = true
+base-node-runner = { workspace = true, features = ["test-utils"] }
 base-common-rpc-types.workspace = true
+base-protocol = { workspace = true, features = ["test-utils"] }
 tokio = { workspace = true, features = ["test-util"] }
 alloy-primitives = { workspace = true, features = ["k256"] }
 metrics-util = { workspace = true, features = ["debugging"] }

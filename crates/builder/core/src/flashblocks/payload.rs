@@ -25,13 +25,15 @@ use base_common_flashblocks::{
 };
 use base_execution_consensus::{calculate_receipt_root_no_memo, isthmus};
 use base_execution_evm::{BaseEvmConfig, BaseNextBlockEnvAttributes};
-use base_execution_payload_builder::{BaseBuiltPayload, BasePayloadBuilderAttributes};
+use base_execution_payload_builder::{
+    BaseBuiltPayload, BasePayloadBuilderAttributes, BuilderMetrics as SharedBuilderMetrics,
+    ValidityMetrics,
+};
 use base_execution_txpool::AccountStateDiff;
 use base_observability_events::{GlobalTransactionEventWriter, TransactionEventType};
 use eyre::WrapErr as _;
 use reth_basic_payload_builder::BuildOutcome;
 use reth_evm::{ConfigureEvm, execute::BlockBuilder};
-use reth_execution_cache::{CachedStateMetrics, CachedStateMetricsSource, CachedStateProvider};
 use reth_execution_types::ChangedAccount;
 use reth_node_api::{Block, BuiltPayloadExecutedBlock, PayloadBuilderError};
 use reth_payload_primitives::PayloadAttributes;
@@ -55,10 +57,8 @@ use tracing::{debug, error, info, metadata::Level, span, warn};
 use crate::{
     BuilderConfig, BuilderMetrics, ExecutionInfo, PayloadBuilder, ResourceLimits,
     flashblocks::{
-        FlashblocksExtraCtx,
-        best_txs::{BestFlashblocksTxs, ParkableBestPayloadTransactions},
-        context::BasePayloadBuilderCtx,
-        generator::BuildArguments,
+        BasePayloadBuilderCtx, BestFlashblocksTxs, FlashblocksExtraCtx,
+        ParkableBestPayloadTransactions, generator::BuildArguments,
     },
     traits::{ClientBounds, PoolBounds},
     transaction_events::{
@@ -287,14 +287,12 @@ where
             )
             .map_err(|e| PayloadBuilderError::Other(e.into()))?;
 
-        let mut state_provider = self.client.state_by_block_hash(ctx.parent().hash())?;
-        if let Some(execution_cache) = execution_cache {
-            state_provider = Box::new(CachedStateProvider::new(
-                state_provider,
-                execution_cache.cache().clone(),
-                Some(CachedStateMetrics::zeroed(CachedStateMetricsSource::Builder)),
-            ));
-        }
+        let state_provider = base_execution_payload_builder::BuilderStateProvider::new(
+            self.client.state_by_block_hash(ctx.parent().hash())?,
+            execution_cache.map(|cache| cache.cache().clone()),
+            self.config.state_provider_metrics,
+        )
+        .into_provider();
         let db = StateProviderDatabase::new(state_provider);
 
         // 1. execute the pre steps and seal an early block with that
@@ -930,6 +928,12 @@ where
 
         // Record cumulative uncompressed block size
         BuilderMetrics::block_uncompressed_size().record(info.cumulative_uncompressed_bytes as f64);
+
+        // Record validity-predicate state loads accumulated across the block's flashblocks.
+        ValidityMetrics::record_predicate_loads(&info.predicate_loads);
+
+        // Record validity inclusion and EIP-1559 fee revenue for the block.
+        SharedBuilderMetrics::record_inclusion(&info.inclusion);
 
         debug!(
             target: "payload_builder",

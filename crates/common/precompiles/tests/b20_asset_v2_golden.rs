@@ -5,16 +5,20 @@
 //! `cancelUIMultiplierUpdate`, ERC-165 advertisement) and the common `seizeWithMemo` surface.
 //! Every op that does not touch those two additions carries V1's verbatim body, and storage is
 //! append-only, so — following the same precedent as `b20_policy_v2_golden.rs` — the
-//! behavior-preserving ops below reuse V1's pinned roots verbatim: this suite still locks V2's
-//! behavior independently (a future edit to V2 that changes state, events, or gas must re-bless
-//! these roots, and can never silently diverge under V1's frozen pins). Ops that do differ at V2
-//! (`updateMultiplier`'s event, `announce`'s inner-call event) get their own fresh pins, as do the
-//! wholly new ops (`updateUIMultiplier`, `cancelUIMultiplierUpdate`, `seizeWithMemo`,
+//! behavior-preserving ops below pin their own roots independently: this suite locks V2's
+//! behavior on its own (a future edit to V2 that changes state, events, or gas must re-bless
+//! these roots). Because these goldens run production Cobalt storage features (see below) while
+//! the V1 suite runs Legacy, a behavior-preserving op's root matches V1's only when the op does
+//! not trigger Cobalt's dynamic tail cleanup; ops that write shrinking dynamic values
+//! (name/symbol/contract-URI) can legitimately diverge from V1's Legacy pin. Ops that differ at
+//! V2 (`updateMultiplier`'s event, `announce`'s inner-call event) get their own fresh pins, as do
+//! the wholly new ops (`updateUIMultiplier`, `cancelUIMultiplierUpdate`, `seizeWithMemo`,
 //! `supportsInterface`).
 //!
 //! Every op is driven through the **version-resolver-gated** dispatch path
 //! (`BaseUpgrade::Cobalt` -> `AssetVersion::V2`) against the real EVM-backed `B20AssetStorage`
-//! over `HashMapStorageProvider`, with a `FakePolicyAccounting` for deterministic allow/block
+//! over `HashMapStorageProvider` configured with `StorageFeatures::Cobalt` (the production
+//! storage config at Cobalt), with a `FakePolicyAccounting` for deterministic allow/block
 //! decisions. Each case asserts:
 //!   1. exact returned ABI bytes (or the typed revert),
 //!   2. resulting state (balances / supply / roles / allowances / multiplier / metadata / storage),
@@ -33,7 +37,7 @@ use base_common_precompiles::{
     Asset, AssetAccounting, AssetV2, AssetVersion, AssetVersions, B20_MAX_SUPPLY_CAP, B20AssetInit,
     B20AssetStorage, B20AssetToken, B20PolicyType, B20TokenRole, ERC165_INTERFACE_ID,
     ERC8056_INTERFACE_IDS, FakePolicyAccounting, IB20, IB20Asset, NoopPrecompileCallObserver,
-    PolicyVersion, TokenAccounting,
+    PolicyVersion, TokenAccounting, UpgradeGatedStorageFeatures,
 };
 use base_precompile_storage::{BasePrecompileError, Handler, HashMapStorageProvider, StorageCtx};
 
@@ -56,8 +60,10 @@ const POLICY_ID_2: u64 = (1u64 << 56) | 8;
 
 // --- pinned storage hashes (bless with BLESS_GOLDEN=1; see module docs) --------
 //
-// Reused verbatim from `b20_asset_v1_golden.rs`: these ops carry V1's unmodified body at V2, and
-// storage is append-only, so dispatching through V2 at Cobalt yields the same snapshot as V1.
+// These ops carry V1's unmodified body at V2 and storage is append-only, so their snapshots track
+// V1's — but pinned independently here: these goldens run `StorageFeatures::Cobalt` while the V1
+// suite runs Legacy, so an op that triggers Cobalt dynamic tail cleanup can diverge from its V1
+// pin. Re-blessing reflects the true Cobalt snapshot for each.
 
 const ROOT_FRESH: B256 = b256!("e29cabf2f5d0e0eedebf4697b61ad93a4a24fa2d911d4004d641bb0b123fa091");
 const ROOT_TRANSFER_PRIV: B256 =
@@ -150,7 +156,10 @@ const ROOT_ANNOUNCE_V2: B256 =
 /// Fresh provider with an initialized `Base Asset` at [`TOKEN`], matching the factory
 /// bootstrap: the multiplier slot is left physically zero and the getter normalizes it to WAD.
 fn fresh() -> HashMapStorageProvider {
-    let mut storage = HashMapStorageProvider::new(CHAIN_ID);
+    let mut storage = HashMapStorageProvider::new_with_storage_features(
+        CHAIN_ID,
+        UpgradeGatedStorageFeatures::from_upgrade(BaseUpgrade::Cobalt),
+    );
     StorageCtx::enter(&mut storage, |ctx| {
         let mut token = B20AssetStorage::from_address(TOKEN, ctx);
         token
@@ -265,10 +274,10 @@ fn domain_separator(storage: &mut HashMapStorageProvider) -> B256 {
     })
 }
 
-/// Configures `from` as seizable (not authorized by `SeizeHolder`) and `to` as an authorized
+/// Configures `from` as seizable (not authorized by `SeizeExempt`) and `to` as an authorized
 /// `SeizeReceiver`, using two distinct policy ids so the two scopes are independently exercised.
 fn make_seizable(token: &mut B20AssetStorage<'_>) {
-    token.set_policy_id(B20PolicyType::SeizeHolder.id(), POLICY_ID).unwrap();
+    token.set_policy_id(B20PolicyType::SeizeExempt.id(), POLICY_ID).unwrap();
     token.set_policy_id(B20PolicyType::SeizeReceiver.id(), POLICY_ID_2).unwrap();
 }
 
@@ -335,7 +344,10 @@ fn dispatch_rejects_nonzero_value() {
 
 #[test]
 fn dispatch_reverts_when_uninitialized() {
-    let mut s = HashMapStorageProvider::new(CHAIN_ID);
+    let mut s = HashMapStorageProvider::new_with_storage_features(
+        CHAIN_ID,
+        UpgradeGatedStorageFeatures::from_upgrade(BaseUpgrade::Cobalt),
+    );
     let calldata = IB20::balanceOfCall { account: ALICE }.abi_encode();
     let out = StorageCtx::enter(&mut s, |ctx| {
         B20AssetToken::with_storage_and_policy(
@@ -358,7 +370,10 @@ fn dispatch_reverts_when_uninitialized() {
 #[test]
 fn golden_dispatch_no_observer_wrapper_reverts_uninitialized() {
     // Exercises the no-observer `dispatch()` wrapper + the is_initialized=false gate.
-    let mut s = HashMapStorageProvider::new(CHAIN_ID);
+    let mut s = HashMapStorageProvider::new_with_storage_features(
+        CHAIN_ID,
+        UpgradeGatedStorageFeatures::from_upgrade(BaseUpgrade::Cobalt),
+    );
     s.set_caller(ALICE);
     let calldata = IB20::balanceOfCall { account: ALICE }.abi_encode();
     let out = StorageCtx::enter(&mut s, |ctx| {
@@ -1064,7 +1079,7 @@ fn golden_seize_reverts_zero_from() {
     let mut s = fresh();
     seed(&mut s, |t| {
         give_role(t, B20TokenRole::Seize.id(), ADMIN);
-        // A non-default `SeizeHolder` treats the zero address as seizable; the `from != 0` guard
+        // A non-default `SeizeExempt` treats the zero address as seizable; the `from != 0` guard
         // still rejects a zero-amount seize that would otherwise emit a mint-like Transfer(0x0,..).
         make_seizable(t);
     });
@@ -1085,8 +1100,8 @@ fn golden_seize_reverts_account_not_seizable() {
     seed(&mut s, |t| {
         fund(t, ALICE, u(100));
         give_role(t, B20TokenRole::Seize.id(), ADMIN);
-        // ALICE authorized under SeizeHolder => not seizable.
-        t.set_policy_id(B20PolicyType::SeizeHolder.id(), POLICY_ID).unwrap();
+        // ALICE authorized under SeizeExempt => not seizable.
+        t.set_policy_id(B20PolicyType::SeizeExempt.id(), POLICY_ID).unwrap();
     });
     let mut policy = FakePolicyAccounting::new();
     policy.allow(POLICY_ID, ALICE);
@@ -1205,7 +1220,7 @@ fn golden_read_seize_role_and_policy_constants() {
     let mut s = fresh();
     let cases: Vec<(Vec<u8>, B256)> = vec![
         (IB20::SEIZE_ROLECall {}.abi_encode(), B20TokenRole::Seize.id()),
-        (IB20::SEIZE_HOLDER_POLICYCall {}.abi_encode(), B20PolicyType::SeizeHolder.id()),
+        (IB20::SEIZE_EXEMPT_POLICYCall {}.abi_encode(), B20PolicyType::SeizeExempt.id()),
         (IB20::SEIZE_RECEIVER_POLICYCall {}.abi_encode(), B20PolicyType::SeizeReceiver.id()),
     ];
     for (calldata, expected) in cases {
@@ -1851,6 +1866,31 @@ fn golden_permit_reverts_when_expired() {
     s.set_timestamp(u(11));
     let err = op(&mut s, owner, FakePolicyAccounting::new(), call.abi_encode()).unwrap_err();
     assert_eq!(err, BasePrecompileError::revert(IB20::ExpiredSignature { deadline: u(10) }));
+}
+
+/// V2 `permit` charges the fixed ECRECOVER-equivalent recovery cost (`PermitArgs::RECOVER_GAS`,
+/// 3000) on the real provider. The `.route(...)` path bills no calldata gas — that lives in
+/// `dispatch_with_observer` — so the observed `gas_deducted()` is exactly the recovery charge. The
+/// V1 golden pins this at `0`; that metered/unmetered contrast is the point of this pair.
+#[test]
+fn golden_permit_charges_recovery_gas() {
+    let mut s = fresh();
+    let owner = anvil_owner();
+    let calldata =
+        signed_permit(domain_separator(&mut fresh()), U256::ZERO, owner, BOB, u(500), U256::MAX)
+            .abi_encode();
+    s.set_caller(owner);
+    s.set_timestamp(U256::ZERO);
+    StorageCtx::enter(&mut s, |ctx| {
+        B20AssetToken::with_storage_and_policy(
+            B20AssetStorage::from_address(TOKEN, ctx),
+            FakePolicyAccounting::new(),
+            PolicyVersion::V2,
+        )
+        .route(ctx, &calldata, AssetVersion::V2, true, NoopPrecompileCallObserver)
+    })
+    .expect("permit must succeed");
+    assert_eq!(s.gas_deducted(), 3000, "V2 permit must charge the fixed ECRECOVER-equivalent cost");
 }
 
 // ============================================================================
@@ -2991,6 +3031,36 @@ fn golden_announce_reverts_id_already_used() {
     );
 }
 
+/// Cantina #16 follow-up: the same malformed `announce` (invalid UTF-8 in `id`) short-circuits at
+/// V2/Cobalt with a cheap, calldata-size-independent rejection instead of paying the owned
+/// decoder's O(aliases · `tail_bytes`) diagnostic construction. Contrast with
+/// `golden_announce_malformed_id_stays_on_owned_diagnostic_at_v1` in the V1 suite, which pins the
+/// opposite: the frozen version must never take this path.
+#[test]
+fn golden_announce_malformed_id_short_circuits_at_v2() {
+    let mut s = fresh();
+    let marker = "malformed-id-marker";
+    let mut calldata = IB20Asset::announceCall {
+        internalCalls: vec![],
+        id: marker.into(),
+        description: String::new(),
+        uri: String::new(),
+    }
+    .abi_encode();
+    let at = calldata.windows(marker.len()).position(|w| w == marker.as_bytes()).unwrap();
+    calldata[at..at + marker.len()].fill(0xff);
+
+    let err = op(&mut s, ALICE, FakePolicyAccounting::new(), calldata).unwrap_err();
+    assert_eq!(
+        err,
+        BasePrecompileError::AbiDecodeFailed {
+            selector: IB20Asset::announceCall::SELECTOR,
+            error: "announce: malformed bytes[] payload".to_string(),
+        },
+        "V2 must reject with the bounded, calldata-size-independent error",
+    );
+}
+
 #[test]
 fn golden_announce_reverts_nested_announce() {
     let mut s = fresh();
@@ -3125,6 +3195,51 @@ fn gas(
     })
     .expect("gas-footprint op must succeed");
     (s.counter_sload(), s.counter_sstore(), s.counter_keccak256())
+}
+
+/// Unprivileged reject-path footprint: `(sload, sstore, keccak256)` after `calldata` reverts.
+///
+/// Locks that a zero-address `transfer` rejects before the transfer-policy-id SLOAD
+/// (Cantina #13 / BOP-600). Privileged success-path `gas()` cannot catch that.
+fn gas_unprivileged_revert(
+    setup: impl FnOnce(&mut B20AssetStorage<'_>),
+    caller: Address,
+    policy: FakePolicyAccounting,
+    calldata: Vec<u8>,
+) -> (u64, u64, u64) {
+    let mut s = fresh();
+    seed(&mut s, setup);
+    s.set_caller(caller);
+    warp(&mut s, U256::ZERO);
+    s.reset_counters();
+    let err = StorageCtx::enter(&mut s, |ctx| {
+        let version =
+            AssetVersions::from_base_upgrade(BaseUpgrade::Cobalt).expect("Cobalt activates V2");
+        B20AssetToken::with_storage_and_policy(
+            B20AssetStorage::from_address(TOKEN, ctx),
+            policy,
+            PolicyVersion::V2,
+        )
+        .route(ctx, &calldata, version, false, NoopPrecompileCallObserver)
+    })
+    .expect_err("reject-path gas golden must revert");
+    assert_eq!(err, BasePrecompileError::revert(IB20::InvalidReceiver { receiver: Address::ZERO }));
+    (s.counter_sload(), s.counter_sstore(), s.counter_keccak256())
+}
+
+#[test]
+fn golden_transfer_unprivileged_zero_receiver_storage_access() {
+    let actual = gas_unprivileged_revert(
+        |t| fund(t, ALICE, u(10)),
+        ALICE,
+        FakePolicyAccounting::new(),
+        IB20::transferCall { to: Address::ZERO, amount: u(1) }.abi_encode(),
+    );
+    // Pause SLOAD only — no transfer_policy_ids SLOAD before InvalidReceiver.
+    bless_or_assert_gas(
+        &[("transfer_unprivileged_zero_receiver", actual)],
+        &[("transfer_unprivileged_zero_receiver", (1, 0, 0))],
+    );
 }
 
 #[test]
@@ -3393,6 +3508,23 @@ fn golden_gas_footprints() {
                 .abi_encode(),
             ),
         ),
+        (
+            "permit",
+            gas(
+                |_t| {},
+                anvil_owner(),
+                FakePolicyAccounting::new(),
+                signed_permit(
+                    domain_separator(&mut fresh()),
+                    U256::ZERO,
+                    anvil_owner(),
+                    BOB,
+                    u(500),
+                    U256::MAX,
+                )
+                .abi_encode(),
+            ),
+        ),
     ];
 
     let expected: &[(&str, (u64, u64, u64))] = &[
@@ -3406,9 +3538,9 @@ fn golden_gas_footprints() {
         ("pause", (1, 1, 0)),
         ("unpause", (1, 1, 0)),
         ("update_supply_cap", (2, 1, 0)),
-        ("update_name", (0, 1, 0)),
-        ("update_symbol", (0, 1, 0)),
-        ("update_contract_uri", (0, 1, 0)),
+        ("update_name", (1, 1, 0)),
+        ("update_symbol", (1, 1, 0)),
+        ("update_contract_uri", (1, 1, 0)),
         ("grant_role", (1, 1, 0)),
         ("revoke_role", (1, 1, 0)),
         ("set_role_admin", (1, 1, 0)),
@@ -3418,7 +3550,8 @@ fn golden_gas_footprints() {
         ("cancel_ui_multiplier_update", (3, 1, 0)),
         ("batch_mint", (11, 4, 0)),
         ("announce", (1, 1, 0)),
-        ("update_extra_metadata", (0, 1, 0)),
+        ("update_extra_metadata", (1, 1, 0)),
+        ("permit", (3, 2, 5)),
     ];
 
     bless_or_assert_gas(&actual, expected);
@@ -3455,6 +3588,7 @@ fn v2_op_coverage_checklist(call: IB20::IB20Calls, ext: IB20Asset::IB20AssetCall
             golden_transfer_unprivileged_allowed,
             golden_transfer_unprivileged_blocked_sender_reverts,
             golden_transfer_reverts_zero_receiver,
+            golden_transfer_unprivileged_zero_receiver_storage_access,
             golden_transfer_reverts_insufficient_balance,
             golden_transfer_reverts_when_paused,
             golden_transfer_reverts_zero_sender,
@@ -3505,7 +3639,7 @@ fn v2_op_coverage_checklist(call: IB20::IB20Calls, ext: IB20Asset::IB20AssetCall
             golden_seize_enforces_receiver_policy,
             golden_seize_privileged_still_enforces_role_and_seizable,
         ]),
-        C::SEIZE_ROLE(_) | C::SEIZE_HOLDER_POLICY(_) | C::SEIZE_RECEIVER_POLICY(_) => {
+        C::SEIZE_ROLE(_) | C::SEIZE_EXEMPT_POLICY(_) | C::SEIZE_RECEIVER_POLICY(_) => {
             covered(&[golden_read_seize_role_and_policy_constants])
         }
 

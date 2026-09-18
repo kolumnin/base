@@ -36,6 +36,45 @@ pub enum SlotTemplate {
     },
 }
 
+/// Source for a storage predicate's comparison value, resolved per transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PredicateValue {
+    /// A fixed comparison value used by every transaction.
+    Fixed(U256),
+    /// The low bit of the transaction sender's address.
+    ///
+    /// This deterministically splits senders between values zero and one, which
+    /// lets stress profiles keep both matching and parked transactions in the
+    /// pool while a shared one-bit storage value changes.
+    SenderParity,
+}
+
+impl PredicateValue {
+    /// Resolves the comparison value for `sender`.
+    pub fn resolve(self, sender: Address) -> U256 {
+        match self {
+            Self::Fixed(value) => value,
+            Self::SenderParity => U256::from(sender.as_slice()[19] & 1),
+        }
+    }
+}
+
+/// Bound for a `block_number` validity predicate.
+///
+/// A block-number predicate may target a fixed absolute block height, or an
+/// offset that is resolved against the current chain height at submission time
+/// (`current_block + offset`). The offset form makes delayed-validity spikes
+/// self-configuring: it accounts for the variable number of funding/setup blocks
+/// that run before measured submission begins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockNumberBound {
+    /// A fixed, absolute block number used as-is.
+    Absolute(U256),
+    /// An offset added to the current block height when the template is
+    /// resolved (`current_block + offset`).
+    Offset(U256),
+}
+
 /// A runtime validity predicate template with literal values pre-parsed.
 ///
 /// Addresses and slots may remain symbolic ([`PredicateAddress::Sender`],
@@ -62,19 +101,20 @@ pub enum ValidityPredicateTemplate {
         mask: Option<U256>,
         /// Comparison operator.
         op: ValidityOperator,
-        /// Right-hand comparison value.
-        value: U256,
+        /// Comparison value source.
+        value: PredicateValue,
     },
     /// Block-number comparison template.
     ///
     /// Carries no address or slot: the block being built is read from the
-    /// builder's context, so this template resolves to the same predicate for
-    /// every transaction.
+    /// builder's context. The [`BlockNumberBound`] is either a fixed absolute
+    /// value (same predicate for every transaction) or an offset resolved
+    /// against the current chain height per prepare round.
     BlockNumber {
         /// Comparison operator.
         op: ValidityOperator,
-        /// Right-hand comparison value.
-        value: U256,
+        /// Right-hand comparison bound (absolute value or runtime offset).
+        bound: BlockNumberBound,
     },
     /// Flashblock-index comparison template.
     ///
@@ -124,6 +164,11 @@ pub enum TxType {
         /// Number of storage slots to write per transaction.
         slots_per_tx: u32,
     },
+    /// Deterministic `DoubleCounter` `increment()` call.
+    DoubleCounter {
+        /// `DoubleCounter` contract address.
+        contract: Address,
+    },
     /// Precompile call.
     Precompile {
         /// Target precompile.
@@ -135,8 +180,8 @@ pub enum TxType {
         /// Looper contract address (required when iterations > 1).
         looper_contract: Option<Address>,
     },
-    /// B-20 precompile token transfer. Each sender creates and transfers its own token, created
-    /// per run during setup.
+    /// B-20 precompile token transfer. Each sender creates its own token per run during setup and
+    /// transfers it to a funded pair partner (alice <-> bob).
     B20,
     /// Osaka (Base Azul) opcode or precompile transaction.
     Osaka {
@@ -219,6 +264,8 @@ pub struct LoadConfig {
     pub separate_setup: Option<PathBuf>,
     /// Duration of the load test. `None` means run indefinitely until stopped.
     pub duration: Option<Duration>,
+    /// Optional measured canonical block window size.
+    pub measurement_blocks: Option<u64>,
     /// Maximum in-flight (unconfirmed) transactions per sender.
     pub max_in_flight_per_sender: usize,
     /// Optional ceiling on total in-flight (unconfirmed) transactions across all senders.
@@ -245,6 +292,8 @@ pub struct LoadConfig {
     pub max_gas_price: u128,
     /// Optional builder flashblocks WebSocket used for early inclusion signals.
     pub flashblocks_ws: Option<Url>,
+    /// Optional canonical `newHeads` WebSocket used for lightweight block-boundary pacing.
+    pub canonical_heads_ws: Option<Url>,
     /// Fraction of transactions that draw a fresh recipient address instead of cycling through
     /// the sender pool. Used to drive account-trie fan-out for account-create workloads.
     pub fresh_recipient_ratio: f64,
@@ -252,6 +301,12 @@ pub struct LoadConfig {
     pub validity_ratio: f64,
     /// Predicate templates attached to each validity-bearing transaction.
     pub validity_predicates: Vec<ValidityPredicateTemplate>,
+    /// Fraction of validity senders in the priority-lead cohort.
+    pub validity_priority_lead_ratio: f64,
+    /// Priority-tip multiplier for the validity priority-lead cohort.
+    pub validity_priority_lead_multiplier: u128,
+    /// Priority-tip divisor for validity-cohort measured transactions.
+    pub validity_priority_fee_divisor: u128,
 }
 
 impl LoadConfig {
@@ -274,15 +329,20 @@ impl LoadConfig {
             block_time: Duration::from_secs(2),
             separate_setup: None,
             duration: Some(Duration::from_secs(30)),
+            measurement_blocks: None,
             max_in_flight_per_sender: DEFAULT_MAX_IN_FLIGHT_PER_SENDER,
             max_total_in_flight: None,
             max_concurrent_submit_requests: None,
             batch_size: crate::rpc::MAX_BATCH_RPC_SIZE,
             max_gas_price: DEFAULT_MAX_GAS_PRICE,
             flashblocks_ws: None,
+            canonical_heads_ws: None,
             fresh_recipient_ratio: 0.0,
             validity_ratio: 0.0,
             validity_predicates: Vec::new(),
+            validity_priority_lead_ratio: 0.0,
+            validity_priority_lead_multiplier: 1,
+            validity_priority_fee_divisor: 1,
         }
     }
 
@@ -326,6 +386,9 @@ impl LoadConfig {
                 "duration must be > 0 (or omit for continuous)".into(),
             ));
         }
+        if self.measurement_blocks == Some(0) {
+            return Err(BaselineError::Config("measurement_blocks must be > 0 when set".into()));
+        }
         if !(0.0..=1.0).contains(&self.fresh_recipient_ratio) {
             return Err(BaselineError::Config(
                 "fresh_recipient_ratio must be between 0.0 and 1.0".into(),
@@ -333,6 +396,19 @@ impl LoadConfig {
         }
         if !(0.0..=1.0).contains(&self.validity_ratio) {
             return Err(BaselineError::Config("validity_ratio must be between 0.0 and 1.0".into()));
+        }
+        if !(0.0..=1.0).contains(&self.validity_priority_lead_ratio) {
+            return Err(BaselineError::Config(
+                "validity_priority_lead_ratio must be between 0.0 and 1.0".into(),
+            ));
+        }
+        if self.validity_priority_lead_multiplier < 1 {
+            return Err(BaselineError::Config(
+                "validity_priority_lead_multiplier must be >= 1".into(),
+            ));
+        }
+        if self.validity_priority_fee_divisor < 1 {
+            return Err(BaselineError::Config("validity_priority_fee_divisor must be >= 1".into()));
         }
         if self.validity_predicates.len() > base_execution_txpool::DEFAULT_MAX_VALIDITY_PREDICATES {
             return Err(BaselineError::Config(format!(
@@ -372,6 +448,12 @@ impl LoadConfig {
         }
         if self.flashblocks_ws.as_ref().is_some_and(|url| !matches!(url.scheme(), "ws" | "wss")) {
             return Err(BaselineError::Config("flashblocks_ws must use ws:// or wss://".into()));
+        }
+        if self.canonical_heads_ws.as_ref().is_some_and(|url| !matches!(url.scheme(), "ws" | "wss"))
+        {
+            return Err(BaselineError::Config(
+                "canonical_heads_ws must use ws:// or wss://".into(),
+            ));
         }
         Ok(())
     }
@@ -434,6 +516,7 @@ impl LoadConfig {
     /// Sets the test to run indefinitely until stopped via the stop flag or Ctrl-C.
     pub const fn with_continuous(mut self) -> Self {
         self.duration = None;
+        self.measurement_blocks = None;
         self
     }
 
@@ -500,5 +583,23 @@ mod tests {
     fn validate_accepts_max_concurrent_submit_requests() {
         let config = LoadConfig::devnet().with_max_concurrent_submit_requests(Some(4));
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_zero_measurement_blocks() {
+        let mut config = LoadConfig::devnet();
+        config.measurement_blocks = Some(0);
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn with_continuous_clears_duration_and_measurement_blocks() {
+        let mut config = LoadConfig::devnet();
+        config.measurement_blocks = Some(250);
+
+        let continuous = config.with_continuous();
+
+        assert_eq!(continuous.duration, None);
+        assert_eq!(continuous.measurement_blocks, None);
     }
 }

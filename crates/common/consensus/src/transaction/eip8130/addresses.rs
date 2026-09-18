@@ -22,6 +22,7 @@
 //! [EIP-8130]: https://eips.ethereum.org/EIPS/eip-8130
 
 use alloy_primitives::{Address, B256, address, b256, keccak256};
+use alloy_sol_types::sol;
 
 /// Canonical [EIP-8130] contract addresses and the node authenticator allowlist.
 ///
@@ -45,46 +46,46 @@ impl Eip8130Contracts {
 
     /// Account Configuration system contract (`ACCOUNT_CONFIG_ADDRESS`). The
     /// protocol reads actor/account state directly from this contract's storage.
-    pub const ACCOUNT_CONFIG: Address = address!("0x813037e2A05629fc16c548Bd804a8EF6a13900aC");
+    pub const ACCOUNT_CONFIG: Address = address!("0x813012Bd8D971928475235BBac6F0488c4A100AC");
 
     /// Per-contract mined CREATE2 salt for [`Self::ACCOUNT_CONFIG`], yielding its
     /// `0x8130…` vanity address.
     pub const ACCOUNT_CONFIG_SALT: B256 =
-        b256!("0x45bad482b56864e546f102ee290204d998c71cc33cfcfa09af9505dfe6c8f85d");
+        b256!("0xd5fe4abe7c2e23a731e7835e5e0ab0445758c8de819e8dd180528e7dcddd79c0");
 
     /// keccak256 of the `ACCOUNT_CONFIG` deployment init code (for CREATE2
     /// derivation and bytecode-drift detection).
     pub const ACCOUNT_CONFIG_INIT_CODE_HASH: B256 =
-        b256!("0x4f6a13702bd4e9eeaee96388a05a6d88d1e243e26a0faa69d166d462009a45ca");
+        b256!("0x60fe45aa9ff559770214f6488ec559057fdefff4fead53ecd8e3711802bbdf9f");
 
     // ─────────────────────────────────────────────────────────────────────────
     // Account implementations (init code embeds `ACCOUNT_CONFIG`)
     // ─────────────────────────────────────────────────────────────────────────
 
     /// Default wallet implementation, used as the target of default EOA delegation.
-    pub const DEFAULT_ACCOUNT: Address = address!("0x81301FDc46B78367F31aD76b1dF7d8E0A4CbadEF");
+    pub const DEFAULT_ACCOUNT: Address = address!("0x81309c54D6Bc190FbBc0FA9f296ea4C6A539ADEf");
 
     /// Per-contract mined CREATE2 salt for [`Self::DEFAULT_ACCOUNT`].
     pub const DEFAULT_ACCOUNT_SALT: B256 =
-        b256!("0x0000000000000000000000000000000000000000000000000000000022bdc0ff");
+        b256!("0x0000000000000000000000000000000000000000000000000000000023195eb6");
 
     /// keccak256 of the `DEFAULT_ACCOUNT` deployment init code.
     pub const DEFAULT_ACCOUNT_INIT_CODE_HASH: B256 =
-        b256!("0xc6dfedbd21379331d7679560f8e8aefc45d6e8e6294126481abc5879aad10465");
+        b256!("0x08f1b05056c9a1406b9d8ec9de14d482149877c83b6a58ea9e855f7bdc0205b3");
 
     /// Canonical high-rate payer account implementation
     /// (`CanonicalHighRatePayerAccount`). Wallets that block ETH transfers when
     /// locked, granting higher EIP-8130 mempool access (rate limits).
     pub const CANONICAL_HIGH_RATE_PAYER_ACCOUNT: Address =
-        address!("0x81308c85356B65c0c9864c6bc252F10eE628Fa57");
+        address!("0x813002fFdd25C81CeF79781702176D453AF0Fa57");
 
     /// Per-contract mined CREATE2 salt for [`Self::CANONICAL_HIGH_RATE_PAYER_ACCOUNT`].
     pub const CANONICAL_HIGH_RATE_PAYER_ACCOUNT_SALT: B256 =
-        b256!("0x000000000000000000000000000000000000000000000000000000009f692906");
+        b256!("0x000000000000000000000000000000000000000000000000000000007257d389");
 
     /// keccak256 of the `CANONICAL_HIGH_RATE_PAYER_ACCOUNT` deployment init code.
     pub const CANONICAL_HIGH_RATE_PAYER_ACCOUNT_INIT_CODE_HASH: B256 =
-        b256!("0xbddb752ec04efde4f2f463e3515c0474235dd0285971808e1d12e84c19d325de");
+        b256!("0x8508466c8ab34d3dd0b31d7209aacde0501852819dfff3926a997f15d90b28c2");
 
     /// keccak256 of the ERC-1167 minimal-proxy *runtime* bytecode whose
     /// implementation is [`Self::CANONICAL_HIGH_RATE_PAYER_ACCOUNT`]:
@@ -96,7 +97,7 @@ impl Eip8130Contracts {
     /// Used to recognize high-rate payer accounts by codehash (e.g. mempool
     /// admission) without resolving an EIP-7702 delegation target.
     pub const CANONICAL_HIGH_RATE_PAYER_PROXY_CODE_HASH: B256 =
-        b256!("0xe8e6da3209c72a5495a70e6ef2f67e9ddfe05718ee168ee5d55050e51c1ad577");
+        b256!("0x567770b5589d02464ad51c8e299cb3fc9192975068969b973839b38263f91c22");
 
     // ─────────────────────────────────────────────────────────────────────────
     // Canonical authenticators (accepted on the EIP-8130 block-validation path)
@@ -133,15 +134,15 @@ impl Eip8130Contracts {
     /// Delegated-validation (1-hop) authenticator contract (init code embeds
     /// `ACCOUNT_CONFIG`).
     pub const DELEGATE_AUTHENTICATOR: Address =
-        address!("0x813055C4f7cBfb8ebB5E2E5CB3eF4Eb2E2b4aDE1");
+        address!("0x81301AA52202f8C6b79Cde660440E3c6A7c5ade1");
 
     /// Per-contract mined CREATE2 salt for [`Self::DELEGATE_AUTHENTICATOR`].
     pub const DELEGATE_AUTHENTICATOR_SALT: B256 =
-        b256!("0x000000000000000000000000000000000000000000000000000000005f7bb101");
+        b256!("0x000000000000000000000000000000000000000000000000000000012b221529");
 
     /// keccak256 of the `DELEGATE_AUTHENTICATOR` deployment init code.
     pub const DELEGATE_AUTHENTICATOR_INIT_CODE_HASH: B256 =
-        b256!("0x8f807018b205427375b3783a5ee81e88818a25534a14ff0048ab68c907e3dc5e");
+        b256!("0x0fa70638e780cea7b2a6305f13b2155e9dfb211e4e31f57a14863031c9c65035");
 
     /// The canonical authenticator allowlist: the deployed `IAuthenticator`
     /// contracts a compliant node accepts on the EIP-8130 block-validation path.
@@ -198,6 +199,24 @@ impl Eip8130Contracts {
     #[must_use]
     pub fn erc1167_proxy_code_hash(implementation: Address) -> B256 {
         keccak256(Self::erc1167_proxy_runtime(implementation))
+    }
+}
+
+sol! {
+    /// ABI of [`Eip8130Contracts::DEFAULT_ACCOUNT`] (`execute` / `executeBatch`).
+    interface IDefaultAccount {
+        /// Inner call of `executeBatch`.
+        struct Call {
+            address target;
+            uint256 value;
+            bytes data;
+        }
+
+        /// Single call from the account; equivalent to a one-element batch.
+        function execute(address target, uint256 value, bytes data) external;
+
+        /// Ordered batch of calls from the account.
+        function executeBatch(Call[] calls) external;
     }
 }
 

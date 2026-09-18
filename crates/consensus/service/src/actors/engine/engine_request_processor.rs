@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use alloy_eips::BlockNumberOrTag;
+use base_common_consensus::BaseTxEnvelope;
 use base_common_genesis::RollupConfig;
 use base_common_rpc_types_engine::BaseExecutionPayloadEnvelope;
 use base_consensus_derive::{ResetSignal, Signal};
@@ -9,7 +10,7 @@ use base_consensus_engine::{
     EngineTaskErrorSeverity, EngineTaskErrors, FinalizeTask, ForkchoiceCheckpointLabel,
     ForkchoiceCheckpointReader, InsertTask, InsertTaskResult, NoopForkchoiceCheckpointReader,
 };
-use base_protocol::L2BlockInfo;
+use base_protocol::{BaseTimeUpdateTx, L2BlockInfo};
 use tokio::{sync::mpsc, task::JoinHandle};
 
 use crate::{
@@ -71,6 +72,9 @@ where
     checkpoint_reader: Arc<dyn ForkchoiceCheckpointReader>,
     /// Writes checkpointed forkchoice state after engine state changes.
     checkpoint_writer: Arc<dyn CheckpointWriter>,
+    /// When set, engine resets are skipped and the bootstrapped L2 unsafe head is retained
+    /// instead of consulting L1 (there is no L1-info deposit to reconstruct the safe head from).
+    skip_reset: bool,
 }
 
 impl<EngineClient_, DerivationClient> EngineProcessor<EngineClient_, DerivationClient>
@@ -120,6 +124,19 @@ where
         )
     }
 
+    /// Constructs a processor whose engine resets are skipped, retaining the bootstrapped
+    /// execution head. Used by the L1-free standalone sequencer.
+    pub fn new_skip_reset(
+        client: Arc<EngineClient_>,
+        config: Arc<RollupConfig>,
+        derivation_client: DerivationClient,
+        engine: Engine<EngineClient_>,
+    ) -> Self {
+        let mut processor = Self::new(client, config, derivation_client, engine);
+        processor.skip_reset = true;
+        processor
+    }
+
     /// Constructs a new [`EngineProcessor`] with checkpoint persistence.
     pub fn new_with_checkpoint(
         client: Arc<EngineClient_>,
@@ -136,6 +153,7 @@ where
             derivation_client,
             el_sync_complete: false,
             engine,
+            skip_reset: false,
             last_finalized_head_checkpointed: L2BlockInfo::default(),
             last_safe_head_checkpointed: L2BlockInfo::default(),
             last_safe_head_sent: L2BlockInfo::default(),
@@ -145,6 +163,13 @@ where
 
     /// Resets the inner [`Engine`] without notifying derivation.
     pub async fn reset_engine_state(&mut self) -> Result<L2BlockInfo, EngineError> {
+        if self.skip_reset {
+            let head = self.engine.state().sync_state.unsafe_head();
+            if head != L2BlockInfo::default() {
+                return Ok(head);
+            }
+        }
+
         // Reset the engine, consulting the checkpoint reader if reth has pruned the labeled
         // safe / finalized block bodies (so the L1 info deposit cannot be reconstructed).
         let l2_safe_head = self
@@ -322,7 +347,9 @@ where
             self.rollup.log_upgrade_activation(
                 envelope.execution_payload.block_number(),
                 envelope.execution_payload.timestamp(),
-                envelope.execution_payload.timestamp().saturating_sub(self.rollup.block_time),
+                self.rollup.l2_block_timestamp(
+                    envelope.execution_payload.block_number().saturating_sub(1),
+                ),
             );
         }
         let task = match result_tx {
@@ -429,6 +456,24 @@ where
 
     /// Handles an unsafe payload supplied through the admin API.
     pub fn handle_admin_unsafe_l2_block(&mut self, envelope: BaseExecutionPayloadEnvelope) {
+        // Admin injection bypasses gossip validation. Leave conversion errors to InsertTask,
+        // but drop invalid schedules at ingress just as the gossip handler does.
+        if let Ok(block) = envelope.execution_payload.clone().try_into_block::<BaseTxEnvelope>()
+            && let Err(error) = BaseTimeUpdateTx::validate_block_timestamp(
+                &self.rollup,
+                &block.body.transactions,
+                block.header.number,
+                block.header.timestamp,
+            )
+        {
+            warn!(
+                target: "engine",
+                %error,
+                block_number = block.header.number,
+                "Dropping admin payload with invalid BaseTime schedule"
+            );
+            return;
+        }
         self.handle_external_unsafe_l2_block(envelope);
     }
 
@@ -645,7 +690,9 @@ mod tests {
     };
     use async_trait::async_trait;
     use base_common_consensus::{BaseTxEnvelope, TxDeposit};
-    use base_common_genesis::{ChainGenesis, RollupConfig, SystemConfig};
+    use base_common_genesis::{
+        BaseUpgradeConfig, ChainGenesis, RollupConfig, SystemConfig, UpgradeConfig,
+    };
     use base_common_rpc_types::Transaction as BaseTransaction;
     use base_common_rpc_types_engine::{BaseExecutionPayload, BaseExecutionPayloadEnvelope};
     use base_consensus_derive::Signal;
@@ -658,7 +705,7 @@ mod tests {
             test_engine_client_builder,
         },
     };
-    use base_protocol::{BlockInfo, L1BlockInfoBedrock, L2BlockInfo};
+    use base_protocol::{BaseTimeUpdateTx, BlockInfo, L1BlockInfoBedrock, L2BlockInfo};
     use rstest::rstest;
     use tokio::sync::{mpsc, watch};
 
@@ -759,6 +806,7 @@ mod tests {
         el_sync_finished: bool,
         unsafe_head: L2BlockInfo,
         safe_head: Option<L2BlockInfo>,
+        config: RollupConfig,
     ) -> (
         EngineProcessor<
             base_consensus_engine::test_utils::MockEngineClient,
@@ -767,7 +815,7 @@ mod tests {
         watch::Receiver<usize>,
     ) {
         let client = Arc::new(test_engine_client_builder().build());
-        let config = Arc::new(RollupConfig::default());
+        let config = Arc::new(config);
         let derivation_client = MockEngineDerivationClient::new();
         let mut initial_state_builder = TestEngineStateBuilder::new()
             .with_unsafe_head(unsafe_head)
@@ -781,6 +829,61 @@ mod tests {
         let engine = Engine::new(initial_state, state_tx, queue_tx);
 
         (EngineProcessor::new(client, config, derivation_client, engine), queue_rx)
+    }
+
+    #[rstest]
+    #[case::wrong_second(3, Some(200), false)]
+    #[case::wrong_slot(2, Some(400), false)]
+    #[case::missing_metadata(2, None, false)]
+    #[case::valid(2, Some(200), true)]
+    #[tokio::test]
+    async fn admin_payload_schedule_is_checked_before_enqueue(
+        #[case] timestamp: u64,
+        #[case] millis: Option<u16>,
+        #[case] valid: bool,
+    ) {
+        let config = RollupConfig {
+            block_time: 2,
+            upgrades: UpgradeConfig {
+                base: BaseUpgradeConfig { denim: Some(2), ..Default::default() },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let unsafe_head = l2_head(1, B256::with_last_byte(1));
+        let mut envelope = unsafe_payload(2, unsafe_head.block_info.hash, B256::with_last_byte(2));
+        let BaseExecutionPayload::V1(payload) = &mut envelope.execution_payload else {
+            unreachable!();
+        };
+        payload.timestamp = timestamp;
+        payload.transactions = vec![l1_info_deposit_tx_bytes().into()];
+        if let Some(millis) = millis {
+            payload.transactions.push(
+                BaseTxEnvelope::from(BaseTimeUpdateTx::new(millis).unwrap().into_deposit_tx(2))
+                    .encoded_2718()
+                    .into(),
+            );
+        }
+
+        if !valid {
+            let (mut local, _) = unsafe_payload_processor(true, unsafe_head, None, config.clone());
+            local.handle_local_unsafe_l2_block(envelope.clone(), None);
+            let error = local.engine.drain().await.unwrap_err();
+            assert_eq!(error.severity(), EngineTaskErrorSeverity::Critical);
+            assert!(local.client.last_new_payload_v2().await.is_none());
+        }
+
+        let (mut admin, queue_rx) = unsafe_payload_processor(true, unsafe_head, None, config);
+        admin.client.set_new_payload_v2_response(valid_fcu().payload_status).await;
+        admin.client.set_fork_choice_updated_v3_response(valid_fcu()).await;
+        admin.handle_admin_unsafe_l2_block(envelope);
+        assert_eq!(*queue_rx.borrow(), usize::from(valid));
+        admin.engine.drain().await.unwrap();
+        assert_eq!(admin.client.last_new_payload_v2().await.is_some(), valid);
+        assert_eq!(
+            admin.engine_state().sync_state.unsafe_head().block_info.number,
+            if valid { 2 } else { 1 }
+        );
     }
 
     #[rstest]
@@ -900,8 +1003,12 @@ mod tests {
         #[case] envelope: BaseExecutionPayloadEnvelope,
         #[case] expected_queue_len: usize,
     ) {
-        let (mut processor, queue_rx) =
-            unsafe_payload_processor(el_sync_finished, unsafe_head, safe_head);
+        let (mut processor, queue_rx) = unsafe_payload_processor(
+            el_sync_finished,
+            unsafe_head,
+            safe_head,
+            RollupConfig::default(),
+        );
 
         if local_payload {
             processor.handle_local_unsafe_l2_block(envelope, None);
@@ -918,6 +1025,38 @@ mod tests {
         }
 
         assert_eq!(*queue_rx.borrow(), expected_queue_len);
+    }
+
+    #[test]
+    fn external_payload_logs_denim_activation_once() {
+        let config = RollupConfig {
+            block_time: 2,
+            upgrades: UpgradeConfig {
+                base: BaseUpgradeConfig { denim: Some(10), ..Default::default() },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (mut processor, _) =
+            unsafe_payload_processor(true, L2BlockInfo::default(), None, config);
+        let (traces, _guard) = base_protocol::capture_traces!();
+
+        for block_number in 5..10 {
+            let mut envelope = unsafe_payload(
+                block_number,
+                B256::with_last_byte(block_number.saturating_sub(1) as u8),
+                B256::with_last_byte(block_number as u8),
+            );
+            let BaseExecutionPayload::V1(payload) = &mut envelope.execution_payload else {
+                unreachable!();
+            };
+            payload.timestamp = 10;
+            processor.enqueue_unsafe_payload_insert(envelope, None, true);
+        }
+
+        let activation_logs =
+            traces.lock().iter().filter(|(_, event)| event.contains("Activated upgrade")).count();
+        assert_eq!(activation_logs, 1);
     }
 
     /// Verifies that when a standalone sequencer (no conductor) is beyond genesis and reth

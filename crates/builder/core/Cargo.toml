@@ -36,6 +36,7 @@ reth-chainspec.workspace = true
 reth-rpc-layer.workspace = true
 reth-storage-api.workspace = true
 reth-chain-state.workspace = true
+reth-engine-tree.workspace = true
 reth-payload-util.workspace = true
 reth-node-builder.workspace = true
 reth-tracing-otlp.workspace = true
@@ -126,7 +127,6 @@ k256.workspace = true
 rand.workspace = true
 sha3.workspace = true
 time.workspace = true
-moka.workspace = true
 http.workspace = true
 eyre.workspace = true
 tower.workspace = true
@@ -158,6 +158,7 @@ tikv-jemallocator = { workspace = true, optional = true }
 [dev-dependencies]
 # workspace
 base-test-utils.workspace = true
+base-txpool-rpc.workspace = true
 base-builder-core = { path = ".", features = ["test-utils"] }
 
 # reth
@@ -192,6 +193,7 @@ http-body-util.workspace = true
 default = [ "jemalloc", "metrics" ]
 metrics = [
 	"base-common-evm/metrics",
+	"base-execution-payload-builder/metrics",
 	"base-metrics/metrics",
 	"base-observability-events/metrics",
 	"dep:metrics",
@@ -216,6 +218,7 @@ test-utils = [
 	"base-execution-rpc/client",
 	"base-node-core/test-utils",
 	"base-node-runner/test-utils",
+	"base-observability-events/test-utils",
 	"ctor",
 	"http-body-util",
 	"hyper",

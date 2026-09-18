@@ -2,11 +2,18 @@
 
 use std::{env, path::PathBuf, sync::Arc, time::Duration};
 
-use base_bundle_extension::BundleExtension;
+use base_builder_metering::{
+    DEFAULT_METERING_STORE_MAX_CAPACITY, DEFAULT_METERING_STORE_TTL_SECS, MeteringStore,
+    MeteringStoreExtension,
+};
 use base_execution_eip8130_rpc_node::{Eip8130RpcExtension, Eip8130RpcMode};
+use base_execution_payload_builder::{
+    NoopMeteringProvider, REJECTION_CACHE_MAX_CAPACITY, REJECTION_CACHE_TTL, RejectionCache,
+    ResourceMeteringConfig, SharedMeteringProvider,
+};
 use base_flashblocks::FlashblocksConfig;
 use base_flashblocks_node::FlashblocksExtension;
-use base_metering::{MeteredOpcodes, MeteringConfig, MeteringExtension, MeteringResourceLimits};
+use base_metering::{MeteredOpcodes, MeteringConfig, MeteringExtension};
 use base_node_core::{HasRollupArgs, RollupArgs};
 use base_node_runner::{BaseNodeBuilder, BaseNodeRunner, LaunchedBaseNode, PayloadServiceBuilder};
 use base_observability_events::{
@@ -14,18 +21,24 @@ use base_observability_events::{
     GlobalTransactionEventWriter, TransactionEventProducer, TransactionEventWriterConfig,
 };
 use base_proofs_extension::ProofsHistoryExtension;
-use base_shadow_indexer::{ShadowIndexerConfig, ShadowIndexerExtension};
-use base_shadow_indexer_db::ShadowDbConfig;
+use base_shadow_indexer::{ShadowIndexerConfig, ShadowIndexerExtension, ShadowRetentionConfig};
+use base_shadow_indexer_db::{
+    DEFAULT_DATABASE, DEFAULT_PORT, DEFAULT_USERNAME, PgConnectionParams, ShadowDbConfig,
+};
 use base_tx_forwarding::{
-    DEFAULT_MAX_BATCH_SIZE, DEFAULT_MAX_RPS, DEFAULT_RESEND_AFTER_MS, TxForwardingConfig,
-    TxForwardingExtension,
+    DEFAULT_INLINE_SIMULATION_QUEUE_CAPACITY, DEFAULT_INLINE_SIMULATION_TIMEOUT_MS,
+    DEFAULT_INLINE_SIMULATION_WORKERS, DEFAULT_MAX_BATCH_SIZE, DEFAULT_MAX_RPS,
+    DEFAULT_RESEND_AFTER_MS, TxForwardingConfig, TxForwardingExtension,
 };
 use base_txpool_rpc::{
-    DEFAULT_MAX_VALIDITY_PREDICATES, SendRawTransactionValidityExtension, TxPoolRpcConfig,
+    DEFAULT_MAX_VALIDITY_EXPIRY_SECS, DEFAULT_MAX_VALIDITY_PREDICATES,
+    SendRawTransactionValidityConfig, SendRawTransactionValidityExtension, TxPoolRpcConfig,
     TxPoolRpcExtension,
 };
 use base_txpool_tracing::{TxPoolExtension, TxpoolConfig};
-use base_upgrade_signal::UpgradeSignalStartupMode;
+use base_upgrade_signal::{
+    UpgradeSignalMetricLayer, UpgradeSignalMetrics, UpgradeSignalStartupMode,
+};
 use tracing::warn;
 use url::Url;
 
@@ -33,18 +46,25 @@ use crate::upgrade_signal::{
     ExecutionUpgradeSignal, ExecutionUpgradeSignalConfig, ExecutionUpgradeSignalRuntimeExtension,
 };
 
-/// CLI arguments for metering RPC and priority-fee resource budgets.
+/// CLI arguments for metering RPC.
 #[derive(Debug, Clone, PartialEq, Eq, Default, clap::Args)]
 pub struct MeteringArgs {
-    /// Enable metering RPC for transaction bundle simulation
-    #[arg(long = "enable-metering", value_name = "ENABLE_METERING")]
+    /// Enable metering RPC for transaction bundle simulation.
+    ///
+    /// Turns on `base_meterBundle`. The native payload builder throttles
+    /// transactions against resource-unit budgets only when this is set and
+    /// `--payload.resource-metering-schedule` is a non-empty file. The
+    /// Flashblocks builder uses `--builder.enable-resource-metering` instead.
+    #[arg(long = "enable-metering", env = "ENABLE_METERING", value_name = "ENABLE_METERING")]
     pub enable_metering: bool,
 
-    /// Whole-block gas budget for priority fee estimation.
-    #[arg(
-        long = "metering.gas-limit",
-        requires_all = ["enable_metering", "metering_target_flashblocks_per_block"]
-    )]
+    /// Comma-separated list of EVM opcodes to track for gas metering
+    /// (e.g., "SSTORE,SLOAD,KECCAK256"). Precompile gas is always tracked.
+    #[arg(long = "metering.metered-opcodes", requires = "enable_metering", value_delimiter = ',')]
+    pub metering_metered_opcodes: Vec<String>,
+
+    /// Deprecated and ignored. Kept so older deployment configurations remain accepted.
+    #[arg(long = "metering.gas-limit", requires = "enable_metering", hide = true)]
     pub metering_gas_limit: Option<u64>,
 
     /// Deprecated and ignored. Kept so older deployment configurations remain accepted.
@@ -52,37 +72,72 @@ pub struct MeteringArgs {
     pub metering_execution_time_us: Option<u64>,
 
     /// Deprecated and ignored. Kept so older deployment configurations remain accepted.
-    #[arg(
-        long = "metering.state-root-time-us",
-        requires_all = ["enable_metering", "metering_target_flashblocks_per_block"],
-        hide = true
-    )]
+    #[arg(long = "metering.state-root-time-us", requires = "enable_metering", hide = true)]
     pub metering_state_root_time_us: Option<u64>,
 
-    /// Whole-block data availability byte budget for priority fee estimation.
-    #[arg(
-        long = "metering.da-bytes",
-        requires_all = ["enable_metering", "metering_target_flashblocks_per_block"]
-    )]
+    /// Deprecated and ignored. Kept so older deployment configurations remain accepted.
+    #[arg(long = "metering.da-bytes", requires = "enable_metering", hide = true)]
     pub metering_da_bytes: Option<u64>,
 
-    /// Target number of tx-pool flashblocks the builder budgets per block.
-    ///
-    /// This excludes the base flashblock at index `0` and is required when gas or DA
-    /// estimation is enabled.
-    #[arg(long = "metering.target-flashblocks-per-block", requires = "enable_metering")]
+    /// Deprecated and ignored. Kept so older deployment configurations remain accepted.
+    #[arg(
+        long = "metering.target-flashblocks-per-block",
+        requires = "enable_metering",
+        hide = true
+    )]
     pub metering_target_flashblocks_per_block: Option<usize>,
 
-    /// Comma-separated list of EVM opcodes to track for gas metering
-    /// (e.g., "SSTORE,SLOAD,KECCAK256"). Precompile gas is always tracked.
-    #[arg(long = "metering.metered-opcodes", requires = "enable_metering", value_delimiter = ',')]
-    pub metering_metered_opcodes: Vec<String>,
+    /// Resource-unit schedule used to throttle transactions in the native
+    /// payload builder.
+    #[command(flatten)]
+    pub resource_metering: ResourceMeteringArgs,
+}
+
+/// CLI arguments for payload resource metering.
+#[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
+pub struct ResourceMeteringArgs {
+    /// JSON file containing the startup resource-metering schedule.
+    ///
+    /// The native payload builder throttles transactions against this schedule
+    /// when `--enable-metering` is set and the file is non-empty. Per-dimension
+    /// `dryRun` observes a budget without excluding transactions.
+    #[arg(long = "payload.resource-metering-schedule", env = "PAYLOAD_RESOURCE_METERING_SCHEDULE")]
+    pub resource_metering_schedule: Option<PathBuf>,
+
+    /// Maximum number of permanently rejected transaction hashes retained by the
+    /// native payload builder.
+    #[arg(
+        long = "payload.rejection-cache-max-capacity",
+        default_value_t = REJECTION_CACHE_MAX_CAPACITY
+    )]
+    pub rejection_cache_max_capacity: u64,
+
+    /// TTL in seconds for native payload rejection-cache entries.
+    #[arg(
+        long = "payload.rejection-cache-ttl-secs",
+        default_value_t = REJECTION_CACHE_TTL.as_secs()
+    )]
+    pub rejection_cache_ttl_secs: u64,
+}
+
+impl Default for ResourceMeteringArgs {
+    fn default() -> Self {
+        Self {
+            resource_metering_schedule: None,
+            rejection_cache_max_capacity: REJECTION_CACHE_MAX_CAPACITY,
+            rejection_cache_ttl_secs: REJECTION_CACHE_TTL.as_secs(),
+        }
+    }
 }
 
 /// Default maximum number of open shadow indexer database connections.
 const DEFAULT_SHADOW_INDEXER_MAX_CONNECTIONS: u32 = 5;
 /// Default timeout when acquiring a shadow indexer database connection.
 const DEFAULT_SHADOW_INDEXER_CONNECTION_TIMEOUT: &str = "30s";
+/// Default age at which persisted shadow blocks are deleted.
+const DEFAULT_SHADOW_INDEXER_RETENTION: &str = "30d";
+/// Default delay between shadow block retention sweeps.
+const DEFAULT_SHADOW_INDEXER_RETENTION_INTERVAL: &str = "1h";
 
 /// CLI arguments for the shadow indexer `ExEx` that persists committed execution blocks.
 #[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
@@ -91,14 +146,50 @@ pub struct ShadowIndexerArgs {
     #[arg(long = "enable-shadow-indexer", env = "ENABLE_SHADOW_INDEXER")]
     pub enable_shadow_indexer: bool,
 
-    /// `PostgreSQL` connection URL for the shadow indexer database.
+    /// Host of the shadow indexer database.
     #[arg(
-        long = "shadow-indexer.database-url",
-        env = "SHADOW_INDEXER_DATABASE_URL",
-        value_name = "SHADOW_INDEXER_DATABASE_URL",
+        long = "shadow-indexer.db-host",
+        env = "SHADOW_INDEXER_DB_HOST",
+        value_name = "SHADOW_INDEXER_DB_HOST",
         requires = "enable_shadow_indexer"
     )]
-    pub shadow_indexer_database_url: Option<String>,
+    pub shadow_indexer_db_host: Option<String>,
+
+    /// Password for the shadow indexer database role.
+    #[arg(
+        long = "shadow-indexer.db-password",
+        env = "SHADOW_INDEXER_DB_PASSWORD",
+        value_name = "SHADOW_INDEXER_DB_PASSWORD",
+        requires = "enable_shadow_indexer"
+    )]
+    pub shadow_indexer_db_password: Option<String>,
+
+    /// Port of the shadow indexer database.
+    #[arg(
+        long = "shadow-indexer.db-port",
+        env = "SHADOW_INDEXER_DB_PORT",
+        default_value_t = DEFAULT_PORT,
+        requires = "enable_shadow_indexer"
+    )]
+    pub shadow_indexer_db_port: u16,
+
+    /// Name of the shadow indexer database.
+    #[arg(
+        long = "shadow-indexer.db-name",
+        env = "SHADOW_INDEXER_DB_NAME",
+        default_value = DEFAULT_DATABASE,
+        requires = "enable_shadow_indexer"
+    )]
+    pub shadow_indexer_db_name: String,
+
+    /// Role to authenticate to the shadow indexer database as.
+    #[arg(
+        long = "shadow-indexer.db-user",
+        env = "SHADOW_INDEXER_DB_USER",
+        default_value = DEFAULT_USERNAME,
+        requires = "enable_shadow_indexer"
+    )]
+    pub shadow_indexer_db_user: String,
 
     /// Maximum number of open shadow indexer database connections.
     #[arg(
@@ -118,18 +209,48 @@ pub struct ShadowIndexerArgs {
         requires = "enable_shadow_indexer"
     )]
     pub shadow_indexer_connection_timeout: Duration,
+
+    /// Age at which persisted shadow blocks are deleted, measured from their last write.
+    #[arg(
+        long = "shadow-indexer.retention",
+        env = "SHADOW_INDEXER_RETENTION",
+        default_value = DEFAULT_SHADOW_INDEXER_RETENTION,
+        value_parser = humantime::parse_duration,
+        requires = "enable_shadow_indexer"
+    )]
+    pub shadow_indexer_retention: Duration,
+
+    /// Delay between shadow block retention sweeps.
+    #[arg(
+        long = "shadow-indexer.retention-interval",
+        env = "SHADOW_INDEXER_RETENTION_INTERVAL",
+        default_value = DEFAULT_SHADOW_INDEXER_RETENTION_INTERVAL,
+        value_parser = humantime::parse_duration,
+        requires = "enable_shadow_indexer"
+    )]
+    pub shadow_indexer_retention_interval: Duration,
 }
 
 impl Default for ShadowIndexerArgs {
     fn default() -> Self {
         Self {
             enable_shadow_indexer: false,
-            shadow_indexer_database_url: None,
+            shadow_indexer_db_host: None,
+            shadow_indexer_db_password: None,
+            shadow_indexer_db_port: DEFAULT_PORT,
+            shadow_indexer_db_name: DEFAULT_DATABASE.to_string(),
+            shadow_indexer_db_user: DEFAULT_USERNAME.to_string(),
             shadow_indexer_max_connections: DEFAULT_SHADOW_INDEXER_MAX_CONNECTIONS,
             shadow_indexer_connection_timeout: humantime::parse_duration(
                 DEFAULT_SHADOW_INDEXER_CONNECTION_TIMEOUT,
             )
             .expect("valid default shadow indexer connection timeout"),
+            shadow_indexer_retention: humantime::parse_duration(DEFAULT_SHADOW_INDEXER_RETENTION)
+                .expect("valid default shadow indexer retention"),
+            shadow_indexer_retention_interval: humantime::parse_duration(
+                DEFAULT_SHADOW_INDEXER_RETENTION_INTERVAL,
+            )
+            .expect("valid default shadow indexer retention interval"),
         }
     }
 }
@@ -236,12 +357,26 @@ pub struct RpcStandardNodeArgs {
     pub enable_experimental_validity_transactions: bool,
 
     /// Maximum validity predicates accepted per experimental transaction.
+    ///
+    /// Capped at [`DEFAULT_MAX_VALIDITY_PREDICATES`], the fixed wire ceiling the
+    /// request deserializer enforces. Values above it can never be honored and
+    /// are rejected at startup rather than silently truncated.
     #[arg(
         long = "experimental-validity-max-predicates",
         default_value_t = DEFAULT_MAX_VALIDITY_PREDICATES,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new()
+            .range(1..=DEFAULT_MAX_VALIDITY_PREDICATES as u64),
         requires = "enable_experimental_validity_transactions"
     )]
     pub experimental_validity_max_predicates: usize,
+
+    /// Maximum lifetime, in seconds, for an experimental validity transaction.
+    #[arg(
+        long = "experimental-validity-max-expiry-secs",
+        default_value_t = DEFAULT_MAX_VALIDITY_EXPIRY_SECS,
+        requires = "enable_experimental_validity_transactions"
+    )]
+    pub experimental_validity_max_expiry_secs: u64,
 
     /// Builder RPC endpoints for transaction forwarding (one forwarder per URL), used by mempool nodes
     #[arg(
@@ -278,6 +413,39 @@ pub struct RpcStandardNodeArgs {
         requires = "enable_tx_forwarding"
     )]
     pub tx_forwarding_max_rps: u32,
+
+    /// Run `meter_bundle` on the mempool node before inserting into the forwarding pool.
+    ///
+    /// Has no effect until the sim-worker path is wired; keep off in production.
+    #[arg(long = "enable-inline-simulation", requires = "enable_tx_forwarding")]
+    pub enable_inline_simulation: bool,
+
+    /// Number of in-process `meter_bundle` workers.
+    #[arg(
+        long = "inline-simulation-workers",
+        value_name = "INLINE_SIMULATION_WORKERS",
+        default_value_t = DEFAULT_INLINE_SIMULATION_WORKERS,
+        requires = "enable_inline_simulation"
+    )]
+    pub inline_simulation_workers: usize,
+
+    /// Bounded queue of txs waiting for `meter_bundle`.
+    #[arg(
+        long = "inline-simulation-queue-capacity",
+        value_name = "INLINE_SIMULATION_QUEUE_CAPACITY",
+        default_value_t = DEFAULT_INLINE_SIMULATION_QUEUE_CAPACITY,
+        requires = "enable_inline_simulation"
+    )]
+    pub inline_simulation_queue_capacity: usize,
+
+    /// Per-transaction `meter_bundle` timeout in milliseconds.
+    #[arg(
+        long = "inline-simulation-timeout-ms",
+        value_name = "INLINE_SIMULATION_TIMEOUT_MS",
+        default_value_t = DEFAULT_INLINE_SIMULATION_TIMEOUT_MS,
+        requires = "enable_inline_simulation"
+    )]
+    pub inline_simulation_timeout_ms: u64,
 }
 
 impl From<RpcStandardNodeArgs> for StandardNodeArgs {
@@ -312,25 +480,61 @@ impl TryFrom<&ShadowIndexerArgs> for ShadowIndexerConfig {
     type Error = eyre::Error;
 
     fn try_from(args: &ShadowIndexerArgs) -> eyre::Result<Self> {
-        let url = if args.enable_shadow_indexer {
-            args.shadow_indexer_database_url.clone().ok_or_else(|| {
-                eyre::eyre!(
-                    "--enable-shadow-indexer (env ENABLE_SHADOW_INDEXER) requires \
-                     --shadow-indexer.database-url (env SHADOW_INDEXER_DATABASE_URL)"
-                )
-            })?
+        let connection = if args.enable_shadow_indexer {
+            let require = |value: &Option<String>, flag: &str, env: &str| {
+                value.clone().ok_or_else(|| {
+                    eyre::eyre!(
+                        "--enable-shadow-indexer (env ENABLE_SHADOW_INDEXER) requires {flag} (env \
+                         {env})"
+                    )
+                })
+            };
+
+            PgConnectionParams {
+                host: require(
+                    &args.shadow_indexer_db_host,
+                    "--shadow-indexer.db-host",
+                    "SHADOW_INDEXER_DB_HOST",
+                )?,
+                port: args.shadow_indexer_db_port,
+                database: args.shadow_indexer_db_name.clone(),
+                username: args.shadow_indexer_db_user.clone(),
+                password: require(
+                    &args.shadow_indexer_db_password,
+                    "--shadow-indexer.db-password",
+                    "SHADOW_INDEXER_DB_PASSWORD",
+                )?,
+            }
         } else {
-            String::new()
+            PgConnectionParams::default()
         };
+
+        if args.enable_shadow_indexer {
+            if args.shadow_indexer_retention.is_zero() {
+                eyre::bail!(
+                    "--shadow-indexer.retention (env SHADOW_INDEXER_RETENTION) must be non-zero"
+                );
+            }
+            if args.shadow_indexer_retention_interval.is_zero() {
+                eyre::bail!(
+                    "--shadow-indexer.retention-interval \
+                     (env SHADOW_INDEXER_RETENTION_INTERVAL) must be non-zero"
+                );
+            }
+        }
 
         Ok(Self {
             enabled: args.enable_shadow_indexer,
             db: ShadowDbConfig {
-                url,
+                connection,
                 max_connections: args.shadow_indexer_max_connections,
                 connection_timeout: args.shadow_indexer_connection_timeout,
             },
             builder_version: env!("CARGO_PKG_VERSION").to_string(),
+            retention: ShadowRetentionConfig {
+                period: args.shadow_indexer_retention,
+                interval: args.shadow_indexer_retention_interval,
+            },
         })
     }
 }
@@ -360,6 +564,10 @@ impl From<&StandardNodeArgs> for TxForwardingConfig {
             .with_resend_after_ms(args.rpc.tx_forwarding_resend_after_ms)
             .with_max_batch_size(args.rpc.tx_forwarding_batch_size)
             .with_max_rps(args.rpc.tx_forwarding_max_rps)
+            .with_inline_simulation(args.rpc.enable_inline_simulation)
+            .with_inline_simulation_workers(args.rpc.inline_simulation_workers)
+            .with_inline_simulation_queue_capacity(args.rpc.inline_simulation_queue_capacity)
+            .with_inline_simulation_timeout_ms(args.rpc.inline_simulation_timeout_ms)
     }
 }
 
@@ -413,7 +621,14 @@ impl StandardBaseRethNode {
         runner: &mut BaseNodeRunner<SB>,
         rollup_args: &RollupArgs,
     ) -> eyre::Result<()> {
-        let Some(config) = Self::upgrade_signal_config(rollup_args)? else {
+        let config = Self::upgrade_signal_config(rollup_args)?;
+        let mode = config.as_ref().map(|config| config.signal_config.mode);
+        // Unified nodes may install their recorder during launch. Include disabled nodes too.
+        runner.add_started_callback(move || {
+            UpgradeSignalMetrics::record_mode(UpgradeSignalMetricLayer::Execution, mode);
+            Ok(())
+        });
+        let Some(config) = config else {
             return Ok(());
         };
 
@@ -463,6 +678,34 @@ impl StandardBaseRethNode {
         // Fail fast on an incomplete upgrade-signal configuration before installing extensions.
         Self::validate_upgrade_signal_args(&rollup_args)?;
         let mut runner = BaseNodeRunner::new(rollup_args.clone());
+        let resource_metering_enabled = args.metering.enable_metering;
+        let provider: SharedMeteringProvider = if resource_metering_enabled
+            && args.metering.resource_metering.resource_metering_schedule.is_some()
+        {
+            // Shared defaults with the Flashblocks builder CLI.
+            let store: SharedMeteringProvider = Arc::new(MeteringStore::new(
+                true,
+                DEFAULT_METERING_STORE_MAX_CAPACITY as usize,
+                Duration::from_secs(DEFAULT_METERING_STORE_TTL_SECS),
+            ));
+            runner.install_ext::<MeteringStoreExtension>(Arc::clone(&store));
+            store
+        } else {
+            Arc::new(NoopMeteringProvider)
+        };
+        let resource_metering = ResourceMeteringConfig::from_parts(
+            resource_metering_enabled,
+            args.metering.resource_metering.resource_metering_schedule.as_deref(),
+            provider,
+        )?;
+        let schedule_operation_names: Vec<String> =
+            resource_metering.schedule.priced_operation_names().map(str::to_string).collect();
+        let rejection_cache = RejectionCache::new(
+            args.metering.resource_metering.rejection_cache_max_capacity,
+            Duration::from_secs(args.metering.resource_metering.rejection_cache_ttl_secs),
+        );
+        runner =
+            runner.with_resource_metering(resource_metering).with_rejection_cache(rejection_cache);
 
         // Create flashblocks config first so we can share its state with metering.
         let flashblocks_config: Option<FlashblocksConfig> = (&args).into();
@@ -502,43 +745,41 @@ impl StandardBaseRethNode {
 
         if args.metering.metering_execution_time_us.is_some()
             || args.metering.metering_state_root_time_us.is_some()
+            || args.metering.metering_gas_limit.is_some()
+            || args.metering.metering_da_bytes.is_some()
+            || args.metering.metering_target_flashblocks_per_block.is_some()
         {
             warn!("deprecated metering resource limit flags are ignored");
         }
 
-        let resource_limits = MeteringResourceLimits {
-            gas_limit: args.metering.metering_gas_limit,
-            da_bytes: args.metering.metering_da_bytes,
-        };
         let metering_config = if args.metering.enable_metering {
-            let metered_opcodes = if args.metering.metering_metered_opcodes.is_empty() {
+            let opcode_names = inspector_opcode_names(
+                args.metering.metering_metered_opcodes.clone(),
+                schedule_operation_names,
+            );
+            let metered_opcodes = if opcode_names.is_empty() {
                 MeteredOpcodes::default()
             } else {
-                MeteredOpcodes::parse(&args.metering.metering_metered_opcodes)?
+                MeteredOpcodes::parse(&opcode_names)?
             }
             .with_all_precompiles();
 
-            let mut config = flashblocks_config
+            flashblocks_config
                 .clone()
                 .map_or_else(MeteringConfig::enabled, MeteringConfig::with_flashblocks)
-                .with_resource_limits(resource_limits)
-                .with_metered_opcodes(metered_opcodes);
-            if let Some(target_flashblocks_per_block) =
-                args.metering.metering_target_flashblocks_per_block
-            {
-                config = config.with_target_flashblocks_per_block(target_flashblocks_per_block);
-            }
-            config
+                .with_metered_opcodes(metered_opcodes)
         } else {
             MeteringConfig::disabled()
         };
         runner.install_ext::<MeteringExtension>(metering_config);
         runner.install_ext::<ShadowIndexerExtension>((&args.shadow_indexer).try_into()?);
-        runner.install_ext::<BundleExtension>(());
         let tx_forwarding_config: TxForwardingConfig = (&args).into();
         if args.rpc.enable_experimental_validity_transactions {
             runner.install_ext::<SendRawTransactionValidityExtension>(
-                args.rpc.experimental_validity_max_predicates,
+                SendRawTransactionValidityConfig {
+                    max_validity_predicates: args.rpc.experimental_validity_max_predicates,
+                    max_validity_expiry_secs: args.rpc.experimental_validity_max_expiry_secs,
+                },
             );
         }
         runner.install_ext::<TxForwardingExtension>(tx_forwarding_config);
@@ -685,6 +926,32 @@ fn parse_otel_resource_attribute(key: &str) -> Option<String> {
     })
 }
 
+/// Opcode and precompile names the metering inspector can parse.
+///
+/// Schedule `STATE_*` post-state effects are not EVM opcodes; unknown names are
+/// skipped so a loaded schedule cannot fail node startup.
+fn inspector_opcode_names(
+    cli_names: impl IntoIterator<Item = String>,
+    schedule_names: impl IntoIterator<Item = impl AsRef<str>>,
+) -> Vec<String> {
+    let mut names: Vec<String> = cli_names.into_iter().collect();
+    for name in schedule_names {
+        let name = name.as_ref();
+        if !is_inspector_opcode_name(name) {
+            continue;
+        }
+        if !names.iter().any(|existing| existing.eq_ignore_ascii_case(name)) {
+            names.push(name.to_string());
+        }
+    }
+    names
+}
+
+fn is_inspector_opcode_name(name: &str) -> bool {
+    !name.to_ascii_uppercase().starts_with("STATE_")
+        && MeteredOpcodes::parse(&[name.to_string()]).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use alloy_primitives::address;
@@ -712,10 +979,15 @@ mod tests {
             enable_tx_forwarding: false,
             enable_experimental_validity_transactions: false,
             experimental_validity_max_predicates: DEFAULT_MAX_VALIDITY_PREDICATES,
+            experimental_validity_max_expiry_secs: DEFAULT_MAX_VALIDITY_EXPIRY_SECS,
             builder_rpc_urls: Vec::new(),
             tx_forwarding_resend_after_ms: DEFAULT_RESEND_AFTER_MS,
             tx_forwarding_batch_size: DEFAULT_MAX_BATCH_SIZE,
             tx_forwarding_max_rps: DEFAULT_MAX_RPS,
+            enable_inline_simulation: false,
+            inline_simulation_workers: DEFAULT_INLINE_SIMULATION_WORKERS,
+            inline_simulation_queue_capacity: DEFAULT_INLINE_SIMULATION_QUEUE_CAPACITY,
+            inline_simulation_timeout_ms: DEFAULT_INLINE_SIMULATION_TIMEOUT_MS,
         }
     }
 
@@ -838,8 +1110,13 @@ mod tests {
             standard_args.rpc.experimental_validity_max_predicates,
             DEFAULT_MAX_VALIDITY_PREDICATES
         );
+        assert_eq!(
+            standard_args.rpc.experimental_validity_max_expiry_secs,
+            DEFAULT_MAX_VALIDITY_EXPIRY_SECS
+        );
         assert!(!config.enabled);
         assert!(config.builder_urls.is_empty());
+        assert!(!config.inline_simulation);
     }
 
     #[test]
@@ -864,13 +1141,133 @@ mod tests {
             "--enable-experimental-validity-transactions",
             "--experimental-validity-max-predicates",
             "8",
+            "--experimental-validity-max-expiry-secs",
+            "45",
         ])
         .args;
 
         assert!(args.rpc.enable_tx_forwarding);
         assert!(args.rpc.enable_experimental_validity_transactions);
         assert_eq!(args.rpc.experimental_validity_max_predicates, 8);
+        assert_eq!(args.rpc.experimental_validity_max_expiry_secs, 45);
         assert_eq!(args.rpc.builder_rpc_urls.len(), 1);
+    }
+
+    #[test]
+    fn experimental_validity_max_predicates_rejects_values_above_the_wire_ceiling() {
+        // The request deserializer bounds batches at DEFAULT_MAX_VALIDITY_PREDICATES,
+        // so a larger configured maximum could never be honored. Reject it at
+        // startup instead of silently accepting an unenforceable limit.
+        let error = CommandParser::<StandardNodeArgs>::try_parse_from([
+            "base-reth",
+            "--enable-experimental-validity-transactions",
+            "--experimental-validity-max-predicates",
+            &(DEFAULT_MAX_VALIDITY_PREDICATES + 1).to_string(),
+        ])
+        .expect_err("a maximum above the wire ceiling should be rejected");
+
+        assert!(error.to_string().contains("--experimental-validity-max-predicates"));
+    }
+
+    #[test]
+    fn experimental_validity_max_predicates_rejects_zero() {
+        let error = CommandParser::<StandardNodeArgs>::try_parse_from([
+            "base-reth",
+            "--enable-experimental-validity-transactions",
+            "--experimental-validity-max-predicates",
+            "0",
+        ])
+        .expect_err("a maximum of zero should be rejected");
+
+        assert!(error.to_string().contains("--experimental-validity-max-predicates"));
+    }
+
+    #[test]
+    fn experimental_validity_max_predicates_accepts_the_wire_ceiling() {
+        let args = CommandParser::<StandardNodeArgs>::parse_from([
+            "base-reth",
+            "--enable-experimental-validity-transactions",
+            "--experimental-validity-max-predicates",
+            &DEFAULT_MAX_VALIDITY_PREDICATES.to_string(),
+        ])
+        .args;
+
+        assert_eq!(args.rpc.experimental_validity_max_predicates, DEFAULT_MAX_VALIDITY_PREDICATES);
+    }
+
+    #[test]
+    fn inline_simulation_requires_forwarding() {
+        let error = CommandParser::<StandardNodeArgs>::try_parse_from([
+            "base-reth",
+            "--enable-inline-simulation",
+        ])
+        .expect_err("inline simulation should require forwarding");
+
+        assert!(error.to_string().contains("--enable-tx-forwarding"));
+    }
+
+    #[test]
+    fn inline_simulation_workers_require_enable_flag() {
+        let error = CommandParser::<StandardNodeArgs>::try_parse_from([
+            "base-reth",
+            "--enable-tx-forwarding",
+            "--builder-rpc-urls",
+            "http://localhost:8545",
+            "--inline-simulation-workers",
+            "8",
+        ])
+        .expect_err("worker count should require --enable-inline-simulation");
+
+        assert!(error.to_string().contains("--enable-inline-simulation"));
+    }
+
+    #[test]
+    fn forwarding_without_inline_simulation_stays_off() {
+        let args = CommandParser::<StandardNodeArgs>::parse_from([
+            "base-reth",
+            "--enable-tx-forwarding",
+            "--builder-rpc-urls",
+            "http://localhost:8545",
+        ])
+        .args;
+        let config = TxForwardingConfig::from(&args);
+
+        assert!(config.enabled);
+        assert!(!config.inline_simulation);
+        assert_eq!(config.inline_simulation_workers, DEFAULT_INLINE_SIMULATION_WORKERS);
+        assert_eq!(
+            config.inline_simulation_queue_capacity,
+            DEFAULT_INLINE_SIMULATION_QUEUE_CAPACITY
+        );
+        assert_eq!(config.inline_simulation_timeout_ms, DEFAULT_INLINE_SIMULATION_TIMEOUT_MS);
+    }
+
+    #[test]
+    fn parses_inline_simulation_flags() {
+        let args = CommandParser::<StandardNodeArgs>::parse_from([
+            "base-reth",
+            "--enable-tx-forwarding",
+            "--builder-rpc-urls",
+            "http://localhost:8545",
+            "--enable-inline-simulation",
+            "--inline-simulation-workers",
+            "8",
+            "--inline-simulation-queue-capacity",
+            "32",
+            "--inline-simulation-timeout-ms",
+            "500",
+        ])
+        .args;
+        let config = TxForwardingConfig::from(&args);
+
+        assert!(args.rpc.enable_inline_simulation);
+        assert_eq!(args.rpc.inline_simulation_workers, 8);
+        assert_eq!(args.rpc.inline_simulation_queue_capacity, 32);
+        assert_eq!(args.rpc.inline_simulation_timeout_ms, 500);
+        assert!(config.inline_simulation);
+        assert_eq!(config.inline_simulation_workers, 8);
+        assert_eq!(config.inline_simulation_queue_capacity, 32);
+        assert_eq!(config.inline_simulation_timeout_ms, 500);
     }
 
     #[test]
@@ -901,15 +1298,16 @@ mod tests {
         let args = CommandParser::<StandardNodeArgs>::parse_from([
             "reth",
             "--enable-metering",
-            "--metering.target-flashblocks-per-block",
-            "4",
-            "--metering.gas-limit",
-            "30000000",
+            "--metering.metered-opcodes",
+            "SSTORE,SLOAD",
         ])
         .args;
 
         assert!(args.metering.enable_metering);
-        assert_eq!(args.metering.metering_gas_limit, Some(30_000_000));
+        assert_eq!(
+            args.metering.metering_metered_opcodes,
+            vec!["SSTORE".to_string(), "SLOAD".to_string()]
+        );
     }
 
     #[test]
@@ -917,53 +1315,178 @@ mod tests {
         let args = CommandParser::<StandardNodeArgs>::parse_from([
             "reth",
             "--enable-shadow-indexer",
-            "--shadow-indexer.database-url",
-            "postgres://localhost/shadow",
+            "--shadow-indexer.db-host",
+            "shadow.example.internal",
+            "--shadow-indexer.db-password",
+            "hunter2",
+            "--shadow-indexer.db-port",
+            "6543",
+            "--shadow-indexer.db-name",
+            "shadow",
+            "--shadow-indexer.db-user",
+            "writer",
             "--shadow-indexer.max-connections",
             "9",
             "--shadow-indexer.connection-timeout",
             "45s",
+            "--shadow-indexer.retention",
+            "3d",
+            "--shadow-indexer.retention-interval",
+            "15m",
         ])
         .args;
 
         assert!(args.shadow_indexer.enable_shadow_indexer);
         assert_eq!(
-            args.shadow_indexer.shadow_indexer_database_url.as_deref(),
-            Some("postgres://localhost/shadow")
+            args.shadow_indexer.shadow_indexer_db_host.as_deref(),
+            Some("shadow.example.internal")
         );
+        assert_eq!(args.shadow_indexer.shadow_indexer_db_password.as_deref(), Some("hunter2"));
+        assert_eq!(args.shadow_indexer.shadow_indexer_db_port, 6543);
+        assert_eq!(args.shadow_indexer.shadow_indexer_db_name, "shadow");
+        assert_eq!(args.shadow_indexer.shadow_indexer_db_user, "writer");
         assert_eq!(args.shadow_indexer.shadow_indexer_max_connections, 9);
         assert_eq!(args.shadow_indexer.shadow_indexer_connection_timeout, Duration::from_secs(45));
+        assert_eq!(
+            args.shadow_indexer.shadow_indexer_retention,
+            Duration::from_secs(3 * 24 * 60 * 60)
+        );
+        assert_eq!(
+            args.shadow_indexer.shadow_indexer_retention_interval,
+            Duration::from_secs(15 * 60)
+        );
     }
 
     #[test]
-    fn test_shadow_indexer_database_url_requires_enable_flag() {
+    fn test_shadow_indexer_retention_defaults_to_thirty_days() {
+        let args = CommandParser::<StandardNodeArgs>::parse_from([
+            "reth",
+            "--enable-shadow-indexer",
+            "--shadow-indexer.db-host",
+            "shadow.example.internal",
+            "--shadow-indexer.db-password",
+            "hunter2",
+        ])
+        .args;
+
+        let config = ShadowIndexerConfig::try_from(&args.shadow_indexer)
+            .expect("enabled shadow indexer config should build");
+
+        assert_eq!(config.retention.period, Duration::from_secs(30 * 24 * 60 * 60));
+        assert_eq!(config.retention.interval, Duration::from_secs(60 * 60));
+    }
+
+    #[test]
+    fn test_shadow_indexer_rejects_zero_retention() {
+        let args = ShadowIndexerArgs {
+            enable_shadow_indexer: true,
+            shadow_indexer_db_host: Some("shadow.example.internal".to_string()),
+            shadow_indexer_db_password: Some("hunter2".to_string()),
+            shadow_indexer_retention: Duration::ZERO,
+            ..ShadowIndexerArgs::default()
+        };
+
+        let error =
+            ShadowIndexerConfig::try_from(&args).expect_err("zero retention should be rejected");
+
+        assert!(error.to_string().contains("--shadow-indexer.retention"));
+    }
+
+    #[test]
+    fn test_shadow_indexer_rejects_zero_retention_interval() {
+        let args = ShadowIndexerArgs {
+            enable_shadow_indexer: true,
+            shadow_indexer_db_host: Some("shadow.example.internal".to_string()),
+            shadow_indexer_db_password: Some("hunter2".to_string()),
+            shadow_indexer_retention_interval: Duration::ZERO,
+            ..ShadowIndexerArgs::default()
+        };
+
+        let error = ShadowIndexerConfig::try_from(&args)
+            .expect_err("zero retention interval should be rejected");
+
+        assert!(error.to_string().contains("--shadow-indexer.retention-interval"));
+    }
+
+    #[test]
+    fn test_standard_node_args_defaults_shadow_indexer_connection_fields() {
+        let args = CommandParser::<StandardNodeArgs>::parse_from([
+            "reth",
+            "--enable-shadow-indexer",
+            "--shadow-indexer.db-host",
+            "shadow.example.internal",
+            "--shadow-indexer.db-password",
+            "hunter2",
+        ])
+        .args;
+
+        let config = ShadowIndexerConfig::try_from(&args.shadow_indexer)
+            .expect("host and password are enough to build the config");
+
+        assert_eq!(config.db.connection.port, DEFAULT_PORT);
+        assert_eq!(config.db.connection.database, DEFAULT_DATABASE);
+        assert_eq!(config.db.connection.username, DEFAULT_USERNAME);
+    }
+
+    #[test]
+    fn test_shadow_indexer_db_host_requires_enable_flag() {
         let error = CommandParser::<StandardNodeArgs>::try_parse_from([
             "reth",
-            "--shadow-indexer.database-url",
-            "postgres://localhost/shadow",
+            "--shadow-indexer.db-host",
+            "shadow.example.internal",
         ])
-        .expect_err("shadow indexer database url should require the enable flag");
+        .expect_err("shadow indexer db host should require the enable flag");
 
         assert!(error.to_string().contains("--enable-shadow-indexer"));
     }
 
     #[test]
-    fn test_shadow_indexer_config_requires_database_url_when_enabled() {
+    fn test_shadow_indexer_config_requires_db_host_when_enabled() {
         let args =
             ShadowIndexerArgs { enable_shadow_indexer: true, ..ShadowIndexerArgs::default() };
         let error = ShadowIndexerConfig::try_from(&args)
-            .expect_err("enabled shadow indexer should require a database url");
+            .expect_err("enabled shadow indexer should require a db host");
 
-        assert!(error.to_string().contains("--shadow-indexer.database-url"));
+        assert!(error.to_string().contains("--shadow-indexer.db-host"));
+    }
+
+    #[test]
+    fn test_shadow_indexer_config_requires_db_password_when_enabled() {
+        let args = ShadowIndexerArgs {
+            enable_shadow_indexer: true,
+            shadow_indexer_db_host: Some("shadow.example.internal".to_string()),
+            ..ShadowIndexerArgs::default()
+        };
+        let error = ShadowIndexerConfig::try_from(&args)
+            .expect_err("enabled shadow indexer should require a db password");
+
+        assert!(error.to_string().contains("--shadow-indexer.db-password"));
     }
 
     #[test]
     fn test_shadow_indexer_config_disabled_by_default() {
         let config = ShadowIndexerConfig::try_from(&ShadowIndexerArgs::default())
-            .expect("disabled shadow indexer config should build without a url");
+            .expect("disabled shadow indexer config should build without connection details");
 
         assert!(!config.enabled);
         assert_eq!(config.builder_version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn test_standard_node_args_parses_resource_metering_flags() {
+        let args = CommandParser::<StandardNodeArgs>::parse_from([
+            "reth",
+            "--enable-metering",
+            "--payload.resource-metering-schedule",
+            "/tmp/resource-metering.json",
+        ])
+        .args;
+
+        assert!(args.metering.enable_metering);
+        assert_eq!(
+            args.metering.resource_metering.resource_metering_schedule.as_deref(),
+            Some(std::path::Path::new("/tmp/resource-metering.json"))
+        );
     }
 
     #[test]
@@ -1013,6 +1536,10 @@ mod tests {
             "5000000",
             "--metering.state-root-time-us",
             "1000000",
+            "--metering.gas-limit",
+            "30000000",
+            "--metering.da-bytes",
+            "1572860",
             "--metering.target-flashblocks-per-block",
             "4",
         ])
@@ -1020,5 +1547,89 @@ mod tests {
 
         assert_eq!(args.metering.metering_execution_time_us, Some(5_000_000));
         assert_eq!(args.metering.metering_state_root_time_us, Some(1_000_000));
+        assert_eq!(args.metering.metering_gas_limit, Some(30_000_000));
+        assert_eq!(args.metering.metering_da_bytes, Some(1_572_860));
+        assert_eq!(args.metering.metering_target_flashblocks_per_block, Some(4));
+        assert!(args.metering.resource_metering.resource_metering_schedule.is_none());
+
+        let config = ResourceMeteringConfig::from_parts(
+            args.metering.enable_metering,
+            args.metering.resource_metering.resource_metering_schedule.as_deref(),
+            Arc::new(NoopMeteringProvider),
+        )
+        .expect("enable-metering without a schedule must still boot");
+        assert!(config.enabled);
+        assert!(!config.is_active());
+    }
+
+    #[test]
+    fn test_standard_node_args_parses_rejection_cache_flags() {
+        let args = CommandParser::<StandardNodeArgs>::parse_from([
+            "reth",
+            "--payload.rejection-cache-max-capacity",
+            "50",
+            "--payload.rejection-cache-ttl-secs",
+            "60",
+        ])
+        .args;
+
+        assert_eq!(args.metering.resource_metering.rejection_cache_max_capacity, 50);
+        assert_eq!(args.metering.resource_metering.rejection_cache_ttl_secs, 60);
+    }
+
+    #[test]
+    fn test_standard_node_args_rejection_cache_defaults() {
+        let args = CommandParser::<StandardNodeArgs>::parse_from(["reth"]).args;
+
+        assert_eq!(
+            args.metering.resource_metering.rejection_cache_max_capacity,
+            REJECTION_CACHE_MAX_CAPACITY
+        );
+        assert_eq!(
+            args.metering.resource_metering.rejection_cache_ttl_secs,
+            REJECTION_CACHE_TTL.as_secs()
+        );
+    }
+
+    #[test]
+    fn inspector_opcode_names_skips_state_prefix_and_unparseable() {
+        let names = inspector_opcode_names(
+            ["SLOAD".to_string()],
+            ["SSTORE", "STATE_NEW_STORAGE_SLOT", "NOT_AN_OPCODE", "sstore"],
+        );
+        assert_eq!(names, vec!["SLOAD".to_string(), "SSTORE".to_string()]);
+    }
+
+    #[test]
+    fn runner_accepts_schedule_state_effect_operation_names() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("schedule.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "version": 1,
+                "dimensions": [{
+                    "name": "cpu",
+                    "blockLimit": 1000000,
+                    "operations": [
+                        {"name": "SSTORE", "countCost": 1},
+                        {"name": "STATE_NEW_STORAGE_SLOT", "countCost": 1},
+                        {"name": "NOT_AN_OPCODE", "countCost": 1}
+                    ]
+                }]
+            }"#,
+        )
+        .expect("write schedule");
+
+        let args = CommandParser::<StandardNodeArgs>::parse_from([
+            "reth",
+            "--enable-metering",
+            "--payload.resource-metering-schedule",
+            path.to_str().expect("utf-8 path"),
+        ])
+        .args;
+
+        StandardBaseRethNode::runner(args)
+            .expect("STATE_ and unknown schedule names must not fail opcode parse");
     }
 }

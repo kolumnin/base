@@ -185,9 +185,9 @@ pub struct GasMetrics {
 pub struct ThroughputSample {
     /// Elapsed time since the test started, in seconds.
     pub elapsed_secs: f64,
-    /// Rolling 30s transactions-per-second at this point.
+    /// Rolling 10-second transactions-per-second at this point.
     pub tps: f64,
-    /// Rolling 30s gas-per-second at this point.
+    /// Rolling 10-second gas-per-second at this point.
     pub gps: f64,
 }
 
@@ -373,6 +373,8 @@ pub struct ConfigSummary {
     pub batch_size: u32,
     /// Test duration.
     pub duration: Option<String>,
+    /// Optional measured canonical block window size.
+    pub measurement_blocks: Option<u64>,
     /// Optional gas-per-second target used to size the per-block mempool floor.
     pub target_gps: Option<u64>,
     /// Expected cadence between canonical blocks.
@@ -392,6 +394,15 @@ pub struct ConfigSummary {
     /// Number of predicate templates attached to validity transactions.
     #[serde(default)]
     pub validity_predicate_count: usize,
+    /// Fraction of validity senders in the priority-lead cohort.
+    #[serde(default)]
+    pub validity_priority_lead_ratio: f64,
+    /// Priority-tip multiplier for the validity priority-lead cohort.
+    #[serde(default = "ConfigSummary::default_priority_multiplier")]
+    pub validity_priority_lead_multiplier: u128,
+    /// Priority-tip divisor for validity-cohort measured transactions.
+    #[serde(default = "ConfigSummary::default_priority_fee_divisor")]
+    pub validity_priority_fee_divisor: u128,
     /// Address of the precompile looper contract.
     pub looper_contract: Option<String>,
     /// Amount of each swap token per sender (in wei, as string).
@@ -402,4 +413,16 @@ pub struct ConfigSummary {
     /// Real-token setup configuration, when enabled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub real_token_setup: Option<serde_json::Value>,
+}
+
+impl ConfigSummary {
+    /// Returns the backward-compatible default validity priority multiplier.
+    pub const fn default_priority_multiplier() -> u128 {
+        1
+    }
+
+    /// Returns the backward-compatible default validity priority-fee divisor.
+    pub const fn default_priority_fee_divisor() -> u128 {
+        1
+    }
 }

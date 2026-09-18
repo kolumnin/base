@@ -24,12 +24,13 @@
 //!    --test b20_asset_v1_golden -- --nocapture` and copy the printed `GOLDEN_ROOT` values.
 
 use alloy_primitives::{Address, B256, Bytes, U256, b256, keccak256};
-use alloy_sol_types::{SolCall, SolError, SolEvent, SolValue};
+use alloy_sol_types::{SolCall, SolError, SolEvent, SolInterface, SolValue};
 use base_common_genesis::BaseUpgrade;
 use base_common_precompiles::{
     Asset, AssetAccounting, AssetV1, AssetVersion, AssetVersions, B20_MAX_SUPPLY_CAP, B20AssetInit,
     B20AssetStorage, B20AssetToken, B20PolicyType, B20TokenRole, FakePolicyAccounting, IB20,
     IB20Asset, NoopPrecompileCallObserver, PolicyVersion, TokenAccounting,
+    UpgradeGatedStorageFeatures,
 };
 use base_precompile_storage::{BasePrecompileError, Handler, HashMapStorageProvider, StorageCtx};
 
@@ -128,7 +129,10 @@ const ROOT_ANNOUNCE: B256 =
 /// Fresh provider with an initialized `Base Asset` at [`TOKEN`], matching the factory
 /// bootstrap: the multiplier slot is left physically zero and the getter normalizes it to WAD.
 fn fresh() -> HashMapStorageProvider {
-    let mut storage = HashMapStorageProvider::new(CHAIN_ID);
+    let mut storage = HashMapStorageProvider::new_with_storage_features(
+        CHAIN_ID,
+        UpgradeGatedStorageFeatures::from_upgrade(BaseUpgrade::Beryl),
+    );
     StorageCtx::enter(&mut storage, |ctx| {
         let mut token = B20AssetStorage::from_address(TOKEN, ctx);
         token
@@ -279,7 +283,7 @@ fn golden_v2_selectors_unknown_at_v1() {
     }
 }
 
-/// The seize common selectors (`seizeWithMemo` and the `SEIZE_ROLE` / `SEIZE_HOLDER_POLICY` /
+/// The seize common selectors (`seizeWithMemo` and the `SEIZE_ROLE` / `SEIZE_EXEMPT_POLICY` /
 /// `SEIZE_RECEIVER_POLICY` getters) were introduced at Cobalt (`AssetV2`). At V1 (Beryl) they are
 /// absent from the frozen common `IB20` surface, so `route` rejects them as `UnknownFunctionSelector`.
 #[test]
@@ -288,7 +292,7 @@ fn golden_seize_selectors_unknown_at_v1() {
     let calls: Vec<Vec<u8>> = vec![
         IB20::seizeWithMemoCall { from: ALICE, to: BOB, amount: u(1), memo: MEMO }.abi_encode(),
         IB20::SEIZE_ROLECall {}.abi_encode(),
-        IB20::SEIZE_HOLDER_POLICYCall {}.abi_encode(),
+        IB20::SEIZE_EXEMPT_POLICYCall {}.abi_encode(),
         IB20::SEIZE_RECEIVER_POLICYCall {}.abi_encode(),
     ];
     for calldata in calls {
@@ -298,13 +302,13 @@ fn golden_seize_selectors_unknown_at_v1() {
     }
 }
 
-/// The seize policy scopes were introduced at Cobalt (`AssetV2`). Although the `SEIZE_HOLDER_POLICY()`
+/// The seize policy scopes were introduced at Cobalt (`AssetV2`). Although the `SEIZE_EXEMPT_POLICY()`
 /// / `SEIZE_RECEIVER_POLICY()` getter selectors are absent from V1, the scope *values* must also not
 /// leak through the common `updatePolicy` selector, which is dialable on V1: V1 rejects them with
 /// `UnsupportedPolicyType`, matching the base-std `v1.0.0` reference.
 #[test]
 fn golden_update_policy_rejects_seize_scopes_at_v1() {
-    for scope in [B20PolicyType::SeizeHolder.id(), B20PolicyType::SeizeReceiver.id()] {
+    for scope in [B20PolicyType::SeizeExempt.id(), B20PolicyType::SeizeReceiver.id()] {
         let mut s = fresh();
         let mut policy = FakePolicyAccounting::new();
         policy.create_existing_policy(7);
@@ -326,7 +330,7 @@ fn golden_update_policy_rejects_seize_scopes_at_v1() {
 /// `policyId` selector is dialable on V1 but must reject the V2-only seize scopes.
 #[test]
 fn golden_policy_id_rejects_seize_scopes_at_v1() {
-    for scope in [B20PolicyType::SeizeHolder.id(), B20PolicyType::SeizeReceiver.id()] {
+    for scope in [B20PolicyType::SeizeExempt.id(), B20PolicyType::SeizeReceiver.id()] {
         let mut s = fresh();
         let err = op(
             &mut s,
@@ -1251,6 +1255,30 @@ fn golden_permit_reverts_when_expired() {
     assert_eq!(err, BasePrecompileError::revert(IB20::ExpiredSignature { deadline: u(10) }));
 }
 
+/// V1 `permit` is deliberately UNMETERED (Beryl's gas schedule is frozen): it hashes with plain
+/// `keccak256` and recovers without a `deduct_gas` charge, so `gas_deducted()` stays `0`. The V2
+/// golden pins this at `3000`; that metered/unmetered contrast is the point of this pair.
+#[test]
+fn golden_permit_charges_no_recovery_gas() {
+    let mut s = fresh();
+    let owner = anvil_owner();
+    let calldata =
+        signed_permit(domain_separator(&mut fresh()), U256::ZERO, owner, BOB, u(500), U256::MAX)
+            .abi_encode();
+    s.set_caller(owner);
+    s.set_timestamp(U256::ZERO);
+    StorageCtx::enter(&mut s, |ctx| {
+        B20AssetToken::with_storage_and_policy(
+            B20AssetStorage::from_address(TOKEN, ctx),
+            FakePolicyAccounting::new(),
+            PolicyVersion::V1,
+        )
+        .route(ctx, &calldata, AssetVersion::V1, true, NoopPrecompileCallObserver)
+    })
+    .expect("permit must succeed");
+    assert_eq!(s.gas_deducted(), 0, "V1 permit must not charge any recovery gas (unmetered)");
+}
+
 // ============================================================================
 // computed reads
 // ============================================================================
@@ -1452,7 +1480,10 @@ fn dispatch_reverts_before_beryl() {
 #[test]
 fn dispatch_reverts_when_uninitialized() {
     // No `fresh()` init and no marker bytecode => is_initialized is false.
-    let mut s = HashMapStorageProvider::new(CHAIN_ID);
+    let mut s = HashMapStorageProvider::new_with_storage_features(
+        CHAIN_ID,
+        UpgradeGatedStorageFeatures::from_upgrade(BaseUpgrade::Beryl),
+    );
     let calldata = IB20::balanceOfCall { account: ALICE }.abi_encode();
     let out = StorageCtx::enter(&mut s, |ctx| {
         B20AssetToken::with_storage_and_policy(
@@ -1841,7 +1872,10 @@ fn golden_revoke_role_noop_when_not_held() {
 #[test]
 fn golden_dispatch_no_observer_wrapper_reverts_uninitialized() {
     // Exercises the no-observer `dispatch()` wrapper + the is_initialized=false gate.
-    let mut s = HashMapStorageProvider::new(CHAIN_ID);
+    let mut s = HashMapStorageProvider::new_with_storage_features(
+        CHAIN_ID,
+        UpgradeGatedStorageFeatures::from_upgrade(BaseUpgrade::Beryl),
+    );
     s.set_caller(ALICE);
     let calldata = IB20::balanceOfCall { account: ALICE }.abi_encode();
     let out = StorageCtx::enter(&mut s, |ctx| {
@@ -2315,6 +2349,35 @@ fn golden_announce_reverts_id_already_used() {
     );
 }
 
+/// Cantina #16 follow-up: a malformed `announce` (invalid UTF-8 in `id`) must keep falling
+/// through to the owned decoder's diagnostic at V1, unchanged — V1's revert bytes are
+/// consensus-frozen and must never take the new V2-only bounded-rejection path.
+#[test]
+fn golden_announce_malformed_id_stays_on_owned_diagnostic_at_v1() {
+    let mut s = fresh();
+    let marker = "malformed-id-marker";
+    let mut calldata = IB20Asset::announceCall {
+        internalCalls: vec![],
+        id: marker.into(),
+        description: String::new(),
+        uri: String::new(),
+    }
+    .abi_encode();
+    let at = calldata.windows(marker.len()).position(|w| w == marker.as_bytes()).unwrap();
+    calldata[at..at + marker.len()].fill(0xff);
+
+    let err = op(&mut s, ALICE, FakePolicyAccounting::new(), calldata.clone()).unwrap_err();
+    let oracle_error = IB20Asset::IB20AssetCalls::abi_decode_validate(&calldata).unwrap_err();
+    assert_eq!(
+        err,
+        BasePrecompileError::AbiDecodeFailed {
+            selector: IB20Asset::announceCall::SELECTOR,
+            error: oracle_error.to_string(),
+        },
+        "V1 must keep falling through to the owned decoder's diagnostic, unchanged",
+    );
+}
+
 #[test]
 fn golden_announce_reverts_internal_call_malformed() {
     let mut s = fresh();
@@ -2668,6 +2731,23 @@ fn golden_gas_footprints() {
                 .abi_encode(),
             ),
         ),
+        (
+            "permit",
+            gas(
+                |_t| {},
+                anvil_owner(),
+                FakePolicyAccounting::new(),
+                signed_permit(
+                    domain_separator(&mut fresh()),
+                    U256::ZERO,
+                    anvil_owner(),
+                    BOB,
+                    u(500),
+                    U256::MAX,
+                )
+                .abi_encode(),
+            ),
+        ),
     ];
 
     let expected: &[(&str, (u64, u64, u64))] = &[
@@ -2691,6 +2771,7 @@ fn golden_gas_footprints() {
         ("batch_mint", (11, 4, 0)),
         ("announce", (1, 1, 0)),
         ("update_extra_metadata", (0, 1, 0)),
+        ("permit", (3, 2, 0)),
     ];
 
     bless_or_assert_gas(&actual, expected);
@@ -2768,7 +2849,7 @@ fn v1_op_coverage_checklist(call: IB20::IB20Calls, ext: IB20Asset::IB20AssetCall
         ]),
         C::seizeWithMemo(_)
         | C::SEIZE_ROLE(_)
-        | C::SEIZE_HOLDER_POLICY(_)
+        | C::SEIZE_EXEMPT_POLICY(_)
         | C::SEIZE_RECEIVER_POLICY(_) => covered(&[golden_seize_selectors_unknown_at_v1]),
 
         // pause / config / roles / policy / permit

@@ -110,6 +110,16 @@ pub enum OracleProviderError {
     /// * `0` - The unknown chain ID that was encountered
     #[error("Unknown chain ID: {0}")]
     UnknownChainId(u64),
+    /// A supported L2 chain resolved an L1 chain without a built-in configuration.
+    ///
+    /// Only the mutable local devnet may take its L1 configuration from the oracle. For every other
+    /// supported chain the L1 chain ID is compiled in, so a missing built-in L1 config means the
+    /// chain configuration itself is inconsistent and the proof must not execute.
+    #[error("Missing built-in L1 chain config for L1 chain ID: {l1_chain_id}")]
+    MissingL1ChainConfig {
+        /// The L1 chain ID that has no built-in configuration.
+        l1_chain_id: u64,
+    },
     /// Rollup config L2 chain ID does not match the boot chain ID.
     ///
     /// This error occurs when an oracle-provided rollup config claims to be for
@@ -130,18 +140,6 @@ pub enum OracleProviderError {
         claim_block: u64,
         /// The configured rollup genesis L2 block number.
         genesis_block: u64,
-    },
-    /// Computing the schedule L2 block timestamp overflowed `u64`.
-    #[error("L2 schedule block timestamp overflow for block {schedule_block}")]
-    L2ScheduleTimestampOverflow {
-        /// The L2 block number used to pin the upgrade schedule.
-        schedule_block: u64,
-    },
-    /// Computing the claimed L2 block timestamp overflowed `u64`.
-    #[error("L2 claim block timestamp overflow for block {claim_block}")]
-    L2ClaimTimestampOverflow {
-        /// The claimed L2 block number.
-        claim_block: u64,
     },
     /// The rollup config has a zero L2 block time.
     #[error("L2 block time must be non-zero")]

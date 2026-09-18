@@ -185,16 +185,24 @@ pub struct Args {
     #[arg(long = "builder.enable-resource-metering", default_value = "false")]
     pub enable_resource_metering: bool,
 
-    /// Accept experimental validity-bearing transactions from forwarding nodes.
+    /// Enable experimental validity-bearing transactions on this builder.
     ///
+    /// Registers `base_sendRawTransactionValidity` for direct ingress and accepts
+    /// validity metadata on `base_insertValidatedTransaction` from forwarding nodes.
     /// Predicates are preserved and enforced during block construction.
     #[arg(long = "builder.enable-experimental-validity-transactions", default_value = "false")]
     pub enable_experimental_validity_transactions: bool,
 
     /// Maximum validity predicates accepted per experimental transaction.
+    ///
+    /// Capped at [`DEFAULT_MAX_VALIDITY_PREDICATES`], the fixed wire ceiling the
+    /// request deserializer enforces. Values above it can never be honored and
+    /// are rejected at startup rather than silently truncated.
     #[arg(
         long = "builder.experimental-validity-max-predicates",
         default_value_t = DEFAULT_MAX_VALIDITY_PREDICATES,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new()
+            .range(1..=DEFAULT_MAX_VALIDITY_PREDICATES as u64),
         requires = "enable_experimental_validity_transactions"
     )]
     pub experimental_validity_max_predicates: usize,
@@ -223,8 +231,8 @@ pub struct Args {
     pub metering_wait_duration_ms: Option<u64>,
 
     /// Hard cutoff, in milliseconds, on cumulative validity-predicate evaluation time per
-    /// flashblock build. Once exceeded, further validity-gated transactions are deferred to a
-    /// later flashblock rather than evaluated.
+    /// builder iteration. Once exceeded, further validity-gated transactions are deferred to a
+    /// later iteration rather than evaluated.
     #[arg(long = "builder.predicate-eval-hard-cutoff-ms", default_value = "10")]
     pub predicate_eval_hard_cutoff_ms: u64,
 
@@ -274,6 +282,22 @@ pub struct Args {
     /// Flashblocks configuration
     #[command(flatten)]
     pub flashblocks: FlashblocksArgs,
+
+    /// Runs both payload builders and selects the basic builder when Denim activates.
+    #[arg(
+        long = "builder.payload-builder-cutover",
+        default_value = "false",
+        conflicts_with = "basic_payload_builder"
+    )]
+    pub payload_builder_cutover: bool,
+
+    /// Runs only the basic payload builder after the cutover is complete.
+    #[arg(
+        long = "builder.basic-payload-builder",
+        default_value = "false",
+        conflicts_with = "payload_builder_cutover"
+    )]
+    pub basic_payload_builder: bool,
 
     /// Transaction event journal configuration
     #[command(flatten)]
@@ -332,6 +356,8 @@ impl Default for Args {
             sampling_ratio: 100,
             manifest_precheck_enabled: true,
             flashblocks: FlashblocksArgs::default(),
+            payload_builder_cutover: false,
+            basic_payload_builder: false,
             transaction_events: TransactionEventsArgs::default(),
             shadow_indexer: ShadowIndexerArgs::default(),
         }
@@ -378,6 +404,7 @@ impl Args {
         );
 
         Ok(BuilderConfig {
+            state_provider_metrics: false,
             block_time: Duration::from_millis(self.chain_block_time),
             block_time_leeway: Duration::from_secs(self.extra_block_deadline_secs),
             da_config: Default::default(),
@@ -464,6 +491,50 @@ mod tests {
     }
 
     #[test]
+    fn experimental_validity_max_predicates_rejects_values_above_the_wire_ceiling() {
+        // The request deserializer bounds batches at DEFAULT_MAX_VALIDITY_PREDICATES,
+        // so a larger configured maximum could never be honored. Reject it at
+        // startup instead of silently accepting an unenforceable limit.
+        let error = CommandParser::try_parse_from([
+            "builder",
+            "--builder.enable-experimental-validity-transactions",
+            "--builder.experimental-validity-max-predicates",
+            &(DEFAULT_MAX_VALIDITY_PREDICATES + 1).to_string(),
+        ])
+        .expect_err("a maximum above the wire ceiling should be rejected");
+
+        assert!(error.to_string().contains("--builder.experimental-validity-max-predicates"));
+    }
+
+    #[test]
+    fn experimental_validity_max_predicates_rejects_zero() {
+        let error = CommandParser::try_parse_from([
+            "builder",
+            "--builder.enable-experimental-validity-transactions",
+            "--builder.experimental-validity-max-predicates",
+            "0",
+        ])
+        .expect_err("a maximum of zero should be rejected");
+
+        assert!(error.to_string().contains("--builder.experimental-validity-max-predicates"));
+    }
+
+    #[test]
+    fn experimental_validity_max_predicates_accepts_the_wire_ceiling() {
+        let parsed = CommandParser::parse_from([
+            "builder",
+            "--builder.enable-experimental-validity-transactions",
+            "--builder.experimental-validity-max-predicates",
+            &DEFAULT_MAX_VALIDITY_PREDICATES.to_string(),
+        ]);
+
+        assert_eq!(
+            parsed.args.experimental_validity_max_predicates,
+            DEFAULT_MAX_VALIDITY_PREDICATES
+        );
+    }
+
+    #[test]
     fn shadow_validity_injection_requires_validity_support() {
         let args = Args { shadow_validity_injection_enabled: true, ..Default::default() };
         assert!(args.builder_api_config().is_err());
@@ -502,6 +573,35 @@ mod tests {
         let parsed =
             CommandParser::parse_from(["test", "--builder.eip8130-manifest-precheck=false"]);
         assert!(!parsed.args.manifest_precheck_enabled);
+    }
+
+    #[test]
+    fn payload_builder_cutover_defaults_to_disabled() {
+        let parsed = CommandParser::parse_from(["test"]);
+        assert!(!parsed.args.payload_builder_cutover);
+        assert!(!parsed.args.basic_payload_builder);
+    }
+
+    #[test]
+    fn payload_builder_cutover_requires_explicit_opt_in() {
+        let parsed = CommandParser::parse_from(["test", "--builder.payload-builder-cutover"]);
+        assert!(parsed.args.payload_builder_cutover);
+    }
+
+    #[test]
+    fn basic_payload_builder_requires_explicit_opt_in() {
+        let parsed = CommandParser::parse_from(["test", "--builder.basic-payload-builder"]);
+        assert!(parsed.args.basic_payload_builder);
+    }
+
+    #[test]
+    fn payload_builder_modes_are_mutually_exclusive() {
+        let parsed = CommandParser::try_parse_from([
+            "test",
+            "--builder.payload-builder-cutover",
+            "--builder.basic-payload-builder",
+        ]);
+        assert!(parsed.is_err());
     }
 
     #[rstest]
@@ -567,7 +667,6 @@ mod tests {
                 gas_fees: U256::ZERO,
                 results: vec![],
                 state_block_number: 0,
-                state_flashblock_index: None,
                 total_gas_used: 21000,
                 total_execution_time_us: 500,
             },
@@ -619,7 +718,6 @@ mod tests {
                 gas_fees: U256::ZERO,
                 results: vec![],
                 state_block_number: 0,
-                state_flashblock_index: None,
                 total_gas_used: 21000,
                 total_execution_time_us: 0,
             },

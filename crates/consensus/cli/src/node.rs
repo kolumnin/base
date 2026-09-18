@@ -351,7 +351,11 @@ impl From<EmbeddedSequencerConsensusNodeConfigArgs> for ConsensusNodeConfigArgs 
 impl ConsensusNodeArgs {
     /// Loads the configured L2 rollup config.
     pub fn load_rollup_config(&self) -> eyre::Result<RollupConfig> {
-        self.config.l2_config.load(&self.chain.l2_chain_id).map_err(|e| eyre::eyre!(e))
+        let mut config =
+            self.config.l2_config.load(&self.chain.l2_chain_id).map_err(|e| eyre::eyre!(e))?;
+        self.validate_da_batch_inbox_override()?;
+        self.config.l1_rpc_args.apply_da_batch_inbox_override(&mut config);
+        Ok(config)
     }
 
     /// Validates that a non-shadow sequencer has a signing key configured.
@@ -374,6 +378,27 @@ impl ConsensusNodeArgs {
         Ok(())
     }
 
+    /// Validates that synthetic account funding is confined to shadow sequencers.
+    pub fn validate_shadow_funding(&self) -> eyre::Result<()> {
+        let sequencer = &self.config.sequencer_flags;
+        if sequencer.shadow_funding_amount.is_some() && sequencer.shadow_funding_address.is_none() {
+            eyre::bail!("shadow funding amount requires a shadow funding address");
+        }
+        if sequencer
+            .shadow_funding_amount
+            .is_some_and(|amount| amount > alloy_primitives::U256::from(u128::MAX))
+        {
+            eyre::bail!("shadow funding amount exceeds u128::MAX (TxDeposit::mint limit)");
+        }
+        if sequencer.shadow_funding_address.is_some()
+            && (!self.config.node_mode.is_sequencer()
+                || sequencer.shadow_blocks_per_cycle.is_none())
+        {
+            eyre::bail!("shadow funding is only supported in shadow sequencer mode");
+        }
+        Ok(())
+    }
+
     /// Validates that the dangerous DA batcher sender override is only used by validators.
     pub fn validate_da_batcher_sender_override(&self) -> eyre::Result<()> {
         if self.config.l1_rpc_args.l1_da_batcher_sender_override.is_some()
@@ -381,6 +406,18 @@ impl ConsensusNodeArgs {
         {
             eyre::bail!(
                 "--l1.dangerously-override-da-batcher-sender is only supported in validator mode"
+            );
+        }
+        Ok(())
+    }
+
+    /// Validates that the dangerous DA batch inbox override is only used by validators.
+    pub fn validate_da_batch_inbox_override(&self) -> eyre::Result<()> {
+        if self.config.l1_rpc_args.l1_da_batch_inbox_override.is_some()
+            && !self.config.node_mode.is_validator()
+        {
+            eyre::bail!(
+                "--l1.dangerously-override-da-batch-inbox is only supported in validator mode"
             );
         }
         Ok(())
@@ -417,7 +454,10 @@ impl ConsensusNodeArgs {
         startup_mode: UpgradeSignalStartupMode,
     ) -> eyre::Result<RollupNode> {
         self.validate_sequencer_key()?;
+        self.validate_shadow_funding()?;
         self.validate_da_batcher_sender_override()?;
+        self.validate_da_batch_inbox_override()?;
+        self.config.l1_rpc_args.apply_da_batch_inbox_override(&mut cfg);
         if let Some(sender) = self.config.l1_rpc_args.l1_da_batcher_sender_override {
             warn!(
                 %sender,
@@ -735,6 +775,29 @@ mod tests {
         assert_eq!(config.l1_rpc_args.l1_da_batcher_sender_override, Some(batcher));
     }
 
+    #[test]
+    fn embedded_consensus_applies_da_batch_inbox_override() {
+        let inbox = address!("3333333333333333333333333333333333333333");
+        let args = CommandParser::<EmbeddedConsensusNodeConfigArgs>::parse_from([
+            "base",
+            "--l1-eth-rpc",
+            "http://localhost:8545",
+            "--l1-beacon",
+            "http://localhost:5052",
+            "--l1.dangerously-override-da-batch-inbox",
+            "0x3333333333333333333333333333333333333333",
+        ])
+        .args;
+        let args = ConsensusNodeArgs::new(
+            ConsensusChainArgs { l2_chain_id: Chain::from(8453_u64) },
+            ConsensusNodeConfigArgs::from(args),
+        );
+
+        let config = args.load_rollup_config().unwrap();
+
+        assert_eq!(config.batch_inbox_address, inbox);
+    }
+
     fn upgrade_schedule(signals: &[(BaseUpgrade, u64)]) -> UpgradeSignalSchedule {
         UpgradeSignalSchedule::new(
             1,
@@ -932,6 +995,66 @@ mod tests {
     }
 
     #[test]
+    fn shadow_funding_is_rejected_outside_shadow_sequencer_mode() {
+        let args = ConsensusNodeArgs::new(
+            ConsensusChainArgs { l2_chain_id: Chain::from(8453_u64) },
+            ConsensusNodeConfigArgs {
+                node_mode: NodeMode::Sequencer,
+                sequencer_flags: SequencerArgs {
+                    shadow_funding_address: Some(address!(
+                        "2222222222222222222222222222222222222222"
+                    )),
+                    ..SequencerArgs::default()
+                },
+                ..default_node_config_args()
+            },
+        );
+
+        assert!(args.validate_shadow_funding().is_err());
+    }
+
+    #[test]
+    fn shadow_funding_is_accepted_in_shadow_sequencer_mode() {
+        let args = ConsensusNodeArgs::new(
+            ConsensusChainArgs { l2_chain_id: Chain::from(8453_u64) },
+            ConsensusNodeConfigArgs {
+                node_mode: NodeMode::Sequencer,
+                sequencer_flags: SequencerArgs {
+                    shadow_blocks_per_cycle: std::num::NonZeroU64::new(10),
+                    shadow_funding_address: Some(address!(
+                        "2222222222222222222222222222222222222222"
+                    )),
+                    ..SequencerArgs::default()
+                },
+                ..default_node_config_args()
+            },
+        );
+
+        assert!(args.validate_shadow_funding().is_ok());
+    }
+
+    #[test]
+    fn shadow_funding_above_deposit_mint_limit_is_rejected() {
+        let args = ConsensusNodeArgs::new(
+            ConsensusChainArgs { l2_chain_id: Chain::from(8453_u64) },
+            ConsensusNodeConfigArgs {
+                node_mode: NodeMode::Sequencer,
+                sequencer_flags: SequencerArgs {
+                    shadow_blocks_per_cycle: std::num::NonZeroU64::new(10),
+                    shadow_funding_address: Some(address!(
+                        "2222222222222222222222222222222222222222"
+                    )),
+                    shadow_funding_amount: Some(U256::from(u128::MAX) + U256::from(1)),
+                    ..SequencerArgs::default()
+                },
+                ..default_node_config_args()
+            },
+        );
+
+        assert!(args.validate_shadow_funding().is_err());
+    }
+
+    #[test]
     fn da_batcher_sender_override_is_rejected_in_sequencer_mode() {
         let args = ConsensusNodeArgs::new(
             ConsensusChainArgs { l2_chain_id: Chain::from(8453_u64) },
@@ -948,6 +1071,29 @@ mod tests {
         );
 
         assert!(args.validate_da_batcher_sender_override().is_err());
+    }
+
+    #[test]
+    fn da_batch_inbox_override_is_rejected_in_sequencer_mode() {
+        let args = ConsensusNodeArgs::new(
+            ConsensusChainArgs { l2_chain_id: Chain::from(8453_u64) },
+            ConsensusNodeConfigArgs {
+                node_mode: NodeMode::Sequencer,
+                l1_rpc_args: L1ClientArgs {
+                    l1_da_batch_inbox_override: Some(address!(
+                        "3333333333333333333333333333333333333333"
+                    )),
+                    ..L1ClientArgs::default()
+                },
+                ..default_node_config_args()
+            },
+        );
+
+        let error = args.load_rollup_config().unwrap_err();
+
+        assert!(error.to_string().contains(
+            "--l1.dangerously-override-da-batch-inbox is only supported in validator mode"
+        ));
     }
 
     #[test]

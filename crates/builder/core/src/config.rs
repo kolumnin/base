@@ -58,9 +58,9 @@ pub struct BuilderConfig {
     /// Transactions younger than this without metering data will be skipped.
     pub metering_wait_duration: Option<Duration>,
 
-    /// Hard cutoff on cumulative validity-predicate evaluation time per flashblock build.
+    /// Hard cutoff on cumulative validity-predicate evaluation time per builder iteration.
     /// Once the cutoff is exceeded, further validity-gated transactions are deferred to a
-    /// later flashblock rather than evaluated. This is the guardrail backing the
+    /// later iteration rather than evaluated. This is the guardrail backing the
     /// `base_builder_predicate_eval_duration_per_block` metric's P99 SLO.
     pub predicate_eval_hard_cutoff: Duration,
 
@@ -86,6 +86,14 @@ pub struct BuilderConfig {
     /// Whether to drop EIP-8130 transactions whose captured authorization
     /// predicates are positively stale before executing them.
     pub manifest_precheck_enabled: bool,
+
+    /// Whether to record per-call state fetch latency for the build loop.
+    ///
+    /// Wraps the builder's state provider so account, storage, and code reads are timed and
+    /// reported under `sync.state_provider` with a `builder` source label, separating build-loop
+    /// IO from the engine's validation-path IO. Adds overhead to every state read, so this is
+    /// driven by reth's `--engine.state-provider-metrics` and stays off by default.
+    pub state_provider_metrics: bool,
 }
 
 impl BuilderConfig {
@@ -121,6 +129,7 @@ impl core::fmt::Debug for BuilderConfig {
             .field("rejected_tx_channel_size", &self.rejected_tx_channel_size)
             .field("max_rejected_txs_per_block", &self.max_rejected_txs_per_block)
             .field("manifest_precheck_enabled", &self.manifest_precheck_enabled)
+            .field("state_provider_metrics", &self.state_provider_metrics)
             .finish()
     }
 }
@@ -143,11 +152,12 @@ impl Default for BuilderConfig {
             metering_wait_duration: None,
             predicate_eval_hard_cutoff: Duration::from_millis(10),
             metering_provider: Arc::new(NoopMeteringProvider),
-            rejection_cache: RejectionCache::new(100_000, Duration::from_secs(1800)),
+            rejection_cache: RejectionCache::default(),
             audit_archiver_url: None,
             rejected_tx_channel_size: 500,
             max_rejected_txs_per_block: 500,
             manifest_precheck_enabled: true,
+            state_provider_metrics: false,
         }
     }
 }
@@ -210,6 +220,13 @@ impl BuilderConfig {
         metering_wait_duration: Option<Duration>,
     ) -> Self {
         self.metering_wait_duration = metering_wait_duration;
+        self
+    }
+
+    /// Sets whether build-loop state reads are timed.
+    #[must_use]
+    pub const fn with_state_provider_metrics(mut self, enabled: bool) -> Self {
+        self.state_provider_metrics = enabled;
         self
     }
 

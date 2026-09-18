@@ -15,7 +15,73 @@ use async_trait::async_trait;
 use crate::{
     ContractError,
     anchor_state_registry::{AnchorPreflight, AnchorRoot, IAnchorStateRegistry},
+    dispute_game_factory::DisputeGameFactoryClient,
 };
+
+/// The first `AggregateVerifier` version that exposes `intervalsForStartingBlock`.
+///
+/// Compared as `(major, minor)`; the patch level is not part of the ABI contract.
+const FORK_AWARE_INTERVALS_VERSION: (u64, u64) = (0, 3);
+
+/// Returns whether an `AggregateVerifier` reporting `version` speaks the fork-aware
+/// interval ABI.
+///
+/// The two ABIs are disjoint, not additive: 0.3.0 added `intervalsForStartingBlock` and
+/// *removed* `BLOCK_INTERVAL()` / `INTERMEDIATE_BLOCK_INTERVAL()`, which it split into
+/// `SLOW_*` and `FAST_*` pairs. Exactly one of the two call shapes is valid for any given
+/// address, and the version is what decides which.
+///
+/// Anything that is not exactly three numeric components is treated as fork-aware. Every
+/// deployed verifier reports `MAJOR.MINOR.PATCH`, so an unreadable one means these bindings
+/// are behind the chain; failing on the new path produces a better error than quietly
+/// calling getters that no longer exist. The patch component is required but not compared —
+/// a string like `0.1.x` is malformed, not a 0.1 release, and must not buy its way onto the
+/// legacy path by having two parseable components in front.
+fn supports_fork_aware_intervals(version: &str) -> bool {
+    let core = version.split(['-', '+']).next().unwrap_or_default();
+    let mut parts = core.split('.');
+    let (Some(major), Some(minor), Some(patch), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return true;
+    };
+    let (Ok(major), Ok(minor), Ok(_)) =
+        (major.trim().parse::<u64>(), minor.trim().parse::<u64>(), patch.trim().parse::<u64>())
+    else {
+        return true;
+    };
+    (major, minor) >= FORK_AWARE_INTERVALS_VERSION
+}
+
+/// Resolves the `(block_interval, intermediate_block_interval)` pair that applies to a
+/// game of `game_type` whose range starts at `starting_block`.
+///
+/// Denim switches the verifier to a shorter cadence at a fixed L2 block, so the pair is
+/// a function of the starting block and must be resolved per game rather than read once
+/// at startup.
+///
+/// The implementation address is read from the factory on every call so a governance
+/// `setImplementation` is picked up without a restart. The implementation — not a game
+/// proxy — is queried because callers resolve intervals for games that do not exist yet
+/// (the anchor's successor, the proposer's next proposal). For an existing game, call
+/// `read_intervals_for_starting_block` on its proxy instead so the pair it was created
+/// with is used even after an implementation upgrade; proxies older than
+/// `AggregateVerifier` 0.3.0 fall back to their fixed interval getters.
+pub async fn resolve_intervals(
+    factory_client: &dyn DisputeGameFactoryClient,
+    verifier_client: &dyn AggregateVerifierClient,
+    game_type: u32,
+    starting_block: u64,
+) -> Result<(u64, u64), ContractError> {
+    let impl_address = factory_client.game_impls(game_type).await?;
+    if impl_address.is_zero() {
+        return Err(ContractError::validation(format!(
+            "no AggregateVerifier implementation registered for game type {game_type}"
+        )));
+    }
+
+    verifier_client.read_intervals_for_starting_block(impl_address, starting_block).await
+}
 
 sol! {
     /// `AggregateVerifier` (dispute game) contract interface.
@@ -54,11 +120,22 @@ sol! {
         /// Returns the parent game's address.
         function parentAddress() external pure returns (address);
 
+        /// Returns the contract's semantic version, e.g. `"0.3.0"`.
+        function version() external pure returns (string memory);
+
         /// Returns the block interval between proposals (immutable on the implementation).
+        /// Removed in `AggregateVerifier` 0.3.0 in favour of `intervalsForStartingBlock`.
         function BLOCK_INTERVAL() external view returns (uint256);
 
         /// Returns the intermediate block interval for intermediate output root checkpoints.
         function INTERMEDIATE_BLOCK_INTERVAL() external view returns (uint256);
+
+        /// Returns the `(blockInterval, intermediateBlockInterval)` pair the verifier
+        /// applies to a game whose range starts at `startingBlock`.
+        function intervalsForStartingBlock(uint256 startingBlock)
+            external
+            view
+            returns (uint256, uint256);
 
         /// Returns the game type.
         function gameType() external view returns (uint32);
@@ -239,6 +316,27 @@ pub trait AggregateVerifierClient: Send + Sync {
         impl_address: Address,
     ) -> Result<u64, ContractError>;
 
+    /// Reads the `(block_interval, intermediate_block_interval)` pair that
+    /// `verifier_address` applies to a game whose range starts at `starting_block`.
+    ///
+    /// Denim switches the verifier to a shorter cadence at a fixed L2 block, so
+    /// the pair is a function of the game's starting block. Callers must resolve
+    /// it per game rather than reading `BLOCK_INTERVAL` once at startup.
+    ///
+    /// `verifier_address` is either the factory's current implementation (for a game
+    /// that does not exist yet) or an existing game's proxy. A game proxy is a CWIA
+    /// clone, not an upgradeable proxy: it delegates to the implementation baked into
+    /// its bytecode at creation, so reading through it returns the pair the game was
+    /// created with regardless of any later `setImplementation`. Verifiers older than
+    /// 0.3.0 fall back to `BLOCK_INTERVAL()` / `INTERMEDIATE_BLOCK_INTERVAL()`; the two
+    /// ABIs are disjoint, so which one applies is decided by reading `version()`, not by
+    /// treating an empty revert as a missing selector.
+    async fn read_intervals_for_starting_block(
+        &self,
+        verifier_address: Address,
+        starting_block: u64,
+    ) -> Result<(u64, u64), ContractError>;
+
     /// Returns the intermediate output roots for the given game.
     ///
     /// The raw bytes are expected to be a concatenation of 32-byte hashes.
@@ -344,6 +442,17 @@ impl AggregateVerifierContractClient {
     /// Creates a new client backed by the given L1 provider.
     pub const fn new(provider: RootProvider) -> Self {
         Self { provider }
+    }
+
+    /// Reads `version()` from a verifier and reports which interval ABI that address speaks.
+    ///
+    /// Works through a game proxy too: `version()` is `pure`, so a CWIA clone reports the
+    /// string of the implementation that governs it, not one of its own.
+    async fn is_fork_aware(&self, verifier_address: Address) -> Result<bool, ContractError> {
+        let contract =
+            IAggregateVerifier::IAggregateVerifierInstance::new(verifier_address, &self.provider);
+        let version: String = contract_call!(contract.version().call(), "version failed")?;
+        Ok(supports_fork_aware_intervals(&version))
     }
 }
 
@@ -459,6 +568,57 @@ impl AggregateVerifierClient for AggregateVerifierContractClient {
         }
 
         Ok(interval)
+    }
+
+    async fn read_intervals_for_starting_block(
+        &self,
+        verifier_address: Address,
+        starting_block: u64,
+    ) -> Result<(u64, u64), ContractError> {
+        let contract =
+            IAggregateVerifier::IAggregateVerifierInstance::new(verifier_address, &self.provider);
+        if !self.is_fork_aware(verifier_address).await? {
+            let (block_interval, intermediate_block_interval) = futures::try_join!(
+                self.read_block_interval(verifier_address),
+                self.read_intermediate_block_interval(verifier_address),
+            )?;
+            if !block_interval.is_multiple_of(intermediate_block_interval) {
+                return Err(ContractError::validation(format!(
+                    "BLOCK_INTERVAL ({block_interval}) is not divisible by INTERMEDIATE_BLOCK_INTERVAL ({intermediate_block_interval})"
+                )));
+            }
+            return Ok((block_interval, intermediate_block_interval));
+        }
+
+        let result = contract_call!(
+            contract.intervalsForStartingBlock(U256::from(starting_block)).call(),
+            "intervalsForStartingBlock failed"
+        )?;
+
+        let block_interval: u64 = result
+            ._0
+            .try_into()
+            .map_err(|_| ContractError::validation("BLOCK_INTERVAL overflows u64"))?;
+        let intermediate_block_interval: u64 = result
+            ._1
+            .try_into()
+            .map_err(|_| ContractError::validation("INTERMEDIATE_BLOCK_INTERVAL overflows u64"))?;
+
+        if block_interval < 2 {
+            return Err(ContractError::validation(
+                "BLOCK_INTERVAL must be at least 2 (single-block proposals are not supported)",
+            ));
+        }
+        if intermediate_block_interval == 0 {
+            return Err(ContractError::validation("INTERMEDIATE_BLOCK_INTERVAL cannot be 0"));
+        }
+        if !block_interval.is_multiple_of(intermediate_block_interval) {
+            return Err(ContractError::validation(format!(
+                "BLOCK_INTERVAL ({block_interval}) is not divisible by INTERMEDIATE_BLOCK_INTERVAL ({intermediate_block_interval})"
+            )));
+        }
+
+        Ok((block_interval, intermediate_block_interval))
     }
 
     async fn intermediate_output_roots(
@@ -697,6 +857,35 @@ mod tests {
     use alloy_sol_types::SolCall as _;
 
     use super::*;
+
+    #[test]
+    fn test_supports_fork_aware_intervals_gates_on_0_3_0() {
+        assert!(!supports_fork_aware_intervals("0.1.0"));
+        assert!(!supports_fork_aware_intervals("0.1.99"));
+
+        assert!(!supports_fork_aware_intervals("0.2.0"));
+        assert!(!supports_fork_aware_intervals("0.2.99"));
+
+        // 0.3.0 is the ABI break (contracts#431 and contracts#438).
+        assert!(supports_fork_aware_intervals("0.3.0"));
+        assert!(supports_fork_aware_intervals("0.10.0"));
+        assert!(supports_fork_aware_intervals("1.0.0"));
+
+        assert!(!supports_fork_aware_intervals("0.2.0-beta.1"));
+        assert!(!supports_fork_aware_intervals("0.1.0-rc.1"));
+        assert!(supports_fork_aware_intervals("0.3.0+deadbeef"));
+
+        assert!(supports_fork_aware_intervals(""));
+        assert!(supports_fork_aware_intervals("unversioned"));
+        assert!(supports_fork_aware_intervals("3"));
+
+        // Malformed strings whose first two components happen to parse below the boundary
+        // must not reach the legacy getters.
+        assert!(supports_fork_aware_intervals("0.1"));
+        assert!(supports_fork_aware_intervals("0.1.x"));
+        assert!(supports_fork_aware_intervals("0.1.0.1"));
+        assert!(supports_fork_aware_intervals("0.1."));
+    }
 
     #[test]
     fn test_encode_nullify_calldata_has_selector() {

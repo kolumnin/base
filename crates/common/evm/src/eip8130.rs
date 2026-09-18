@@ -837,7 +837,7 @@ impl Eip8130Executor {
                 .resolve_actor_config(sender, sender_actor_id)
                 .map_err(BaseTransactionError::eip8130)?
                 .scope;
-            let policy_gated = actor_scope & Eip8130Constants::SCOPE_POLICY != 0;
+            let policy_gated = Eip8130Constants::sender_is_policy_gated(actor_scope);
             let policy_target = if policy_gated {
                 acc.get_policy_manager(sender, sender_actor_id)
                     .map_err(BaseTransactionError::eip8130)?
@@ -1056,7 +1056,7 @@ impl Eip8130Executor {
                     NonceValidator::validate_sequence(tx, current_nonce, NonceMode::Inclusion)
                         .map_err(BaseTransactionError::eip8130)?;
                     nonce_mgr
-                        .increment_nonce_from_current(sender, nonce_key, current_nonce)
+                        .increment_nonce(sender, nonce_key)
                         .map_err(BaseTransactionError::eip8130)?;
                     (current_nonce == 0, false)
                 };
@@ -1757,20 +1757,6 @@ impl Eip8130Executor {
             .with_account_info(sender, |info| Ok(info.is_empty_code_hash()))
             .map_err(BaseTransactionError::eip8130)?;
         if is_codeless {
-            // Same guard as an explicit delegation's `DelegationEffect::install`:
-            // empty code on a keystore-established account (e.g. an imported
-            // account whose delegation was later cleared, or an EIP-6780
-            // same-transaction `SELFDESTRUCT`) is not proof of a key-backed EOA,
-            // so it must not be auto-delegated to `DEFAULT_ACCOUNT` as if it were
-            // one. Fail closed, mirroring `ApplyError::ContractEstablishedCodeless`.
-            let contract_established = AccountConfigurationStorage::new(sctx)
-                .is_contract_established(sender)
-                .map_err(BaseTransactionError::eip8130)?;
-            if contract_established {
-                return Err(BaseTransactionError::eip8130(
-                    ApplyError::ContractEstablishedCodeless { account: sender },
-                ));
-            }
             let target = Eip8130Contracts::DEFAULT_ACCOUNT;
             sctx.set_code(sender, Bytecode::new_eip7702(target))
                 .map_err(BaseTransactionError::eip8130)?;
@@ -2039,33 +2025,32 @@ mod tests {
     }
 
     #[test]
-    fn auto_delegate_skips_contract_established_codeless_sender() {
-        // Auto-delegation carries the same `FLAG_CONTRACT_ESTABLISHED` guard as an
-        // explicit `DelegationEffect::install`: a plain codeless EOA is delegated
-        // to `DEFAULT_ACCOUNT`, but a keystore-established codeless account (e.g.
-        // an imported account whose delegation was cleared) must fail closed.
+    fn auto_delegate_codeless_sender_delegates_to_default_account() {
+        // A codeless sender is auto-delegated to `DEFAULT_ACCOUNT` so it can
+        // dispatch its calls; a sender that already has code is left untouched.
         let plain = address!("0x00000000000000000000000000000000000000c1");
-        let established = address!("0x00000000000000000000000000000000000000c2");
+        let coded = address!("0x00000000000000000000000000000000000000c2");
         let mut provider = HashMapStorageProvider::new(CHAIN_ID);
         StorageCtx::enter(&mut provider, |ctx| {
-            // A non-established codeless sender is auto-delegated.
             assert!(
                 Eip8130Executor::auto_delegate_codeless_sender(ctx, plain).unwrap(),
-                "plain codeless EOA must be auto-delegated"
+                "codeless EOA must be auto-delegated"
             );
-
-            // Mark a codeless account keystore-established: auto-delegation must
-            // reject it rather than resurrect it as a DEFAULT_ACCOUNT delegate.
-            let mut acc = AccountConfigurationStorage::new(ctx);
-            let mut state = acc.get_account_state(established).unwrap();
-            state.flags = Eip8130Constants::FLAG_CONTRACT_ESTABLISHED;
-            acc.set_account_state(established, state).unwrap();
-            let err = Eip8130Executor::auto_delegate_codeless_sender(ctx, established).unwrap_err();
+            ctx.set_code(coded, Bytecode::new_raw(Bytes::from_static(&[0x60, 0x00]))).unwrap();
             assert!(
-                err.to_string().contains("contract-established"),
-                "expected ContractEstablishedCodeless, got: {err}"
+                !Eip8130Executor::auto_delegate_codeless_sender(ctx, coded).unwrap(),
+                "a sender with code must not be auto-delegated"
             );
         });
+
+        assert_eq!(
+            provider
+                .get_account_info(plain)
+                .and_then(|info| info.code.as_ref())
+                .and_then(Bytecode::eip7702_address),
+            Some(Eip8130Contracts::DEFAULT_ACCOUNT),
+            "codeless sender must delegate to DEFAULT_ACCOUNT"
+        );
     }
 
     #[test]
@@ -2597,7 +2582,7 @@ mod tests {
                 payload: authorize_change_data(
                     session_actor,
                     Eip8130Constants::K1_AUTHENTICATOR,
-                    Eip8130Constants::SCOPE_SENDER | Eip8130Constants::SCOPE_POLICY,
+                    Eip8130Constants::SCOPE_POLICY,
                     0,
                     &policy_data,
                 ),
@@ -3054,8 +3039,9 @@ mod tests {
         Eip8130Signed::new(tx, Bytes::from(auth), Bytes::new())
     }
 
-    /// Seeds a policy-gated `SENDER | PAYER` k1 actor for `account`,
-    /// authorized to the `signer` key and gated to `target`, then commits it.
+    /// Seeds a policy-gated k1 actor for `account`, authorized to the `signer`
+    /// key and gated to `target`, then commits it. POLICY-only (plus payer/nonce
+    /// grants): OPERATOR would override POLICY and leave the sender ungated.
     fn seed_gated_sender(
         evm: &mut BaseEvm<InMemoryDB, NoOpInspector, PrecompilesMap>,
         account: Address,
@@ -3070,19 +3056,18 @@ mod tests {
             let mut provider = JournalStorageProvider::new(internals, Address::ZERO);
             StorageCtx::enter(&mut provider, |sctx| {
                 let mut acc = AccountConfigurationStorage::new(sctx);
-                acc.actor_config
+                acc.actors
                     .at_mut(&actor_id)
                     .at_mut(&account)
                     .write(pack_actor(
                         Eip8130Constants::K1_AUTHENTICATOR,
-                        Eip8130Constants::SCOPE_SENDER
+                        Eip8130Constants::SCOPE_POLICY
                             | Eip8130Constants::SCOPE_SELF_PAYER
-                            | Eip8130Constants::SCOPE_NONCE
-                            | Eip8130Constants::SCOPE_POLICY,
+                            | Eip8130Constants::SCOPE_NONCE,
                         0,
                     ))
                     .unwrap();
-                acc.policy_manager.at_mut(&actor_id).at_mut(&account).write(target).unwrap();
+                acc.set_policy(account, actor_id, target, B256::ZERO).unwrap();
             });
         }
         let state = evm.ctx_mut().journal_mut().finalize();
@@ -3188,7 +3173,7 @@ mod tests {
         // address must authorize and be *included* through the full
         // `Eip8130Executor::execute` pipeline — not just the unit-level
         // `authorize_and_apply`. Before the fix this returned
-        // `BaseTransactionError::Eip8130("...NotBound")` and was rejected at every
+        // `BaseTransactionError::Eip8130("...AuthenticatorMismatch")` and was rejected at every
         // flashblock. Non-empty runtime code mirrors the on-chain account.
         let key = signing_key(0xc1);
         let (derived, signed) = counterfactual_create_signed(&key, bytes!("00"), Vec::new());

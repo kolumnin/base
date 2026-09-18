@@ -1,15 +1,14 @@
 use alloy_primitives::{Bytes, U256};
 use alloy_sol_types::SolCall;
 use base_common_genesis::BaseUpgrade;
-use base_precompile_storage::{BasePrecompileError, StorageCtx};
-use revm::precompile::PrecompileResult;
+use base_precompile_storage::{BasePrecompileError, PrecompileResult, StorageCtx};
 
 use crate::{
-    ActivationFeature, ActivationRegistryStorage, BerylAuxiliaryMetrics, BerylCallRecorder,
-    BerylMetricLabels,
+    ActivationFeature, ActivationRegistryStorage,
     IPolicyRegistry::{self, IPolicyRegistryCalls as C},
     NoopPrecompileCallObserver, PolicyRegistryStorage, PolicyRegistryV2, PolicyVersion,
-    PolicyVersions, PrecompileCallObserver,
+    PolicyVersions, PrecompileAuxiliaryMetrics, PrecompileCallObserver, PrecompileCallRecorder,
+    PrecompileMetricLabels,
 };
 
 impl PolicyRegistryStorage<'_> {
@@ -37,8 +36,10 @@ impl PolicyRegistryStorage<'_> {
     where
         O: PrecompileCallObserver,
     {
-        let mut recorder =
-            BerylCallRecorder::start(observer.clone(), BerylMetricLabels::policy_call(calldata));
+        let mut recorder = PrecompileCallRecorder::start(
+            observer.clone(),
+            PrecompileMetricLabels::policy_call(calldata),
+        );
         if !ctx.call_value().is_zero() {
             return recorder.record_base_error_result(
                 ctx,
@@ -67,7 +68,8 @@ impl PolicyRegistryStorage<'_> {
                         || sel == IPolicyRegistry::policyExistsCall::SELECTOR
                         || sel == IPolicyRegistry::policyAdminCall::SELECTOR
                         || sel == IPolicyRegistry::pendingPolicyAdminCall::SELECTOR
-                        || sel == IPolicyRegistry::compositePolicyChildIdsCall::SELECTOR) =>
+                        || sel == IPolicyRegistry::compositePolicyChildIdsCall::SELECTOR
+                        || sel == IPolicyRegistry::invertedPolicyIdCall::SELECTOR) =>
             {
                 self.route(calldata, version, &observer)
             }
@@ -106,7 +108,7 @@ impl PolicyRegistryStorage<'_> {
             }
             C::createPolicyWithAccounts(call) => {
                 observer.record_batch_items(
-                    &BerylAuxiliaryMetrics::singleton("policy", "createPolicyWithAccounts"),
+                    &PrecompileAuxiliaryMetrics::singleton("policy", "createPolicyWithAccounts"),
                     call.accounts.len(),
                 );
                 let id = logic.create_policy_with_accounts(
@@ -131,7 +133,7 @@ impl PolicyRegistryStorage<'_> {
             }
             C::updateAllowlist(call) => {
                 observer.record_batch_items(
-                    &BerylAuxiliaryMetrics::singleton("policy", "updateAllowlist"),
+                    &PrecompileAuxiliaryMetrics::singleton("policy", "updateAllowlist"),
                     call.accounts.len(),
                 );
                 logic.update_allowlist(self, call.policyId, call.allowed, call.accounts)?;
@@ -139,7 +141,7 @@ impl PolicyRegistryStorage<'_> {
             }
             C::updateBlocklist(call) => {
                 observer.record_batch_items(
-                    &BerylAuxiliaryMetrics::singleton("policy", "updateBlocklist"),
+                    &PrecompileAuxiliaryMetrics::singleton("policy", "updateBlocklist"),
                     call.accounts.len(),
                 );
                 logic.update_blocklist(self, call.policyId, call.blocked, call.accounts)?;
@@ -196,6 +198,11 @@ impl PolicyRegistryStorage<'_> {
                 Ok(IPolicyRegistry::compositePolicyChildIdsCall::abi_encode_returns(&children)
                     .into())
             }
+            // Introduced in V3 (Denim).
+            C::invertedPolicyId(call) => {
+                let policy_id = logic.compute_inverted_policy_id(call.policyId)?;
+                Ok(IPolicyRegistry::invertedPolicyIdCall::abi_encode_returns(&policy_id).into())
+            }
         }
     }
 }
@@ -207,13 +214,12 @@ mod tests {
     use alloy_primitives::{Address, Bytes, address};
     use alloy_sol_types::{SolCall, SolError, SolValue};
     use base_common_genesis::BaseUpgrade;
-    use base_precompile_storage::{HashMapStorageProvider, StorageCtx};
-    use revm::precompile::PrecompileOutput;
+    use base_precompile_storage::{HashMapStorageProvider, PrecompileOutput, StorageCtx};
 
     use crate::{
-        ActivationAdminConfig, ActivationFeature, ActivationRegistryStorage, BerylErrorKind,
-        IPolicyRegistry, PolicyRegistryStorage, PolicyRegistryV1, PrecompileCallMetric,
-        PrecompileCallObserver, PrecompileCallOutcome, PrecompileCallStatus,
+        ActivationAdminConfig, ActivationFeature, ActivationRegistryStorage, IPolicyRegistry,
+        PolicyRegistryStorage, PolicyRegistryV1, PrecompileCallMetric, PrecompileCallObserver,
+        PrecompileCallOutcome, PrecompileCallStatus, PrecompileErrorKind,
     };
 
     const ACTIVATION_ADMIN: Address = address!("0xcb00000000000000000000000000000000000000");
@@ -343,7 +349,7 @@ mod tests {
         assert_eq!(calls[0].0.precompile, "policy");
         assert_eq!(calls[0].0.method, "createPolicy");
         assert_eq!(calls[0].1.status, PrecompileCallStatus::Revert);
-        assert_eq!(calls[0].1.error, Some(BerylErrorKind::FeatureInactive));
+        assert_eq!(calls[0].1.error, Some(PrecompileErrorKind::FeatureInactive));
     }
 
     #[test]
@@ -561,6 +567,20 @@ mod tests {
             Some(IPolicyRegistry::createPolicyCall::SELECTOR.as_ref()),
             "revert must be AbiDecodeFailed, not FeatureNotActivated"
         );
+    }
+
+    #[test]
+    fn malformed_known_selector_returns_selector_only_at_cobalt() {
+        let mut storage = HashMapStorageProvider::new_with_storage_features(
+            1,
+            base_precompile_storage::StorageFeatures::Cobalt,
+        );
+        let selector = IPolicyRegistry::policyExistsCall::SELECTOR;
+
+        let out = run_at(&mut storage, &selector, BaseUpgrade::Cobalt);
+
+        assert!(out.is_revert());
+        assert_eq!(out.bytes, Bytes::from(selector));
     }
 
     fn create_allowlist_policy(storage: &mut HashMapStorageProvider) -> u64 {

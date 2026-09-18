@@ -22,8 +22,8 @@ mod build 'etc/just/build.just'
 mod succinct 'etc/just/succinct.just'
 # Standalone user-funded prover stack (user RPCs + Succinct Network key)
 mod prover 'etc/just/prover.just'
-# Local no-Nitro proof stack for the single-Anvil L1 devnet
-mod anvil-no-nitro 'etc/just/anvil-no-nitro.just'
+# Local Nitro proof stack for the single-Anvil L1 devnet
+mod anvil-nitro-local 'etc/just/anvil-nitro-local.just'
 # Prover-service JSON-RPC request helpers
 mod zk-prover 'etc/just/zk-prover.just'
 # Challenge / dispute helpers
@@ -99,6 +99,10 @@ install-nextest:
 test: install-nextest build::contracts build::elfs
     cargo nextest run --workspace --all-features --exclude base-system-tests --no-fail-fast
 
+# Checks published Base snapshot manifests without downloading snapshot archives (live network)
+check-snapshot-manifests:
+    cargo test --locked -p base --test snapshot_defaults -- --ignored --nocapture
+
 # Runs tests only for crates affected by changes vs main (excludes system tests)
 test-affected base="main": install-nextest build::contracts build::elfs
     #!/usr/bin/env bash
@@ -145,6 +149,23 @@ test-affected-ci base="main": install-nextest build::contracts
 # Runs cargo hack against the workspace
 hack:
     cargo hack check --feature-powerset --no-dev-deps
+
+# Apply etc/upstream-pins/reth.toml to every git-based reth-* workspace dep.
+# Workflow: etc/upstream-pins/README.md
+pin-reth:
+    python3 etc/scripts/local/pin-reth.py apply
+
+# Verify Cargo.toml and Cargo.lock match etc/upstream-pins/reth.toml
+check-reth-pin:
+    python3 etc/scripts/local/pin-reth.py check
+
+# Run unit tests for the Reth pin and release helpers
+pin-reth-test:
+    python3 etc/scripts/local/pin-reth.py test
+
+# Squash GitHub PRs onto an official tag, publish the fork tag, and pin it
+reth-prepare-release *args:
+    python3 etc/scripts/local/pin-reth.py prepare {{ args }}
 
 # Fixes any formatting issues
 format-fix:

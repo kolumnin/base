@@ -2,8 +2,8 @@
 
 mod config;
 pub use config::{
-    DEFAULT_MAX_GAS_PRICE, DEFAULT_MAX_IN_FLIGHT_PER_SENDER, LoadConfig, PredicateAddress,
-    SlotTemplate, TxConfig, TxType, ValidityPredicateTemplate,
+    BlockNumberBound, DEFAULT_MAX_GAS_PRICE, DEFAULT_MAX_IN_FLIGHT_PER_SENDER, LoadConfig,
+    PredicateAddress, PredicateValue, SlotTemplate, TxConfig, TxType, ValidityPredicateTemplate,
 };
 
 mod backoff;
@@ -15,13 +15,16 @@ pub use flashblock_watcher::FlashblockWatcher;
 mod block_watcher;
 pub use block_watcher::{BlockClock, BlockPulse, BlockWatcher};
 
+mod canonical_head_watcher;
+pub use canonical_head_watcher::CanonicalHeadWatcher;
+
 mod inclusion;
 pub use inclusion::{InclusionPulse, InclusionSource};
 
 mod results_tracker;
 pub use results_tracker::{
-    BlockMatch, BlockObservation, BlockReceipt, FlashblockInclusion, ResultsTracker,
-    SentTransaction,
+    BlockMatch, BlockObservation, BlockReceipt, FlashblockInclusion, MeasurementWindow,
+    ResultsTracker, SentTransaction,
 };
 
 mod submission;
